@@ -25,10 +25,7 @@ from google.oauth2.service_account import Credentials
 # --- Настройки: замените на свои ---
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 SPREADSHEET_KEY = os.environ["SPREADSHEET_KEY"]
-cred_str = os.environ["CREDENTIALS_JSON"]
-with open("service_account.json", "w", encoding="utf-8") as f:
-    f.write(cred_str)
-CREDENTIALS_FILE = "service_account.json"
+CREDENTIALS_FILE = "/etc/secrets/cats-476112-9a44bf3e38e2.json"
 BONUS_CHANNEL = "@gg_ssr"
 
 # Максимум спинов (если нужно ограничить)
@@ -587,4 +584,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
