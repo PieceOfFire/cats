@@ -6,6 +6,8 @@ from datetime import datetime
 import pytz
 import time
 import asyncio
+import os
+import json
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
@@ -21,9 +23,12 @@ import gspread
 from google.oauth2.service_account import Credentials
 
 # --- Настройки: замените на свои ---
-BOT_TOKEN = "8308701525:AAGCziQW_pWGvfGdsAEUt7n1a8nVHo0NPM4"
-CREDENTIALS_FILE = "cats-476112-9a44bf3e38e2.json"  # путь к вашему service account
-SPREADSHEET_KEY = "1zexGXo5cw2yqMlOg-5oYrUzWutyWwD2d_pyhv8KZPQM"  # id таблицы
+BOT_TOKEN = os.environ["BOT_TOKEN"]
+SPREADSHEET_KEY = os.environ["SPREADSHEET_KEY"]
+cred_str = os.environ["CREDENTIALS_JSON"]
+with open("service_account.json", "w", encoding="utf-8") as f:
+    f.write(cred_str)
+CREDENTIALS_FILE = "service_account.json"
 BONUS_CHANNEL = "@gg_ssr"
 
 # Максимум спинов (если нужно ограничить)
@@ -582,3 +587,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
