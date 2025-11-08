@@ -8,6 +8,9 @@ import time
 import asyncio
 import os
 import json
+import threading
+import http.server
+import socketserver
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
@@ -581,8 +584,17 @@ def main():
     print("Бот запущен")
     app.run_polling()
 
+def keep_alive():
+    port = int(os.environ.get("PORT", 8080))
+    handler = http.server.SimpleHTTPRequestHandler
+    with socketserver.TCPServer(("", port), handler) as httpd:
+        print(f"✅ Keep-alive web server running on port {port}")
+        httpd.serve_forever()
+
+threading.Thread(target=keep_alive, daemon=True).start()
 
 if __name__ == "__main__":
     main()
+
 
 
