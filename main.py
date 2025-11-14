@@ -38,7 +38,8 @@ MAX_SPINS = 999
 PROMO_CODES = {
     "WATERMELON": {"bonus": 3, "column": "G", "desc": "🍉 Арбуз Арбуз"},
     "HEHE": {"bonus": 1, "column": "H", "desc": "Вот твоё бесплатное хе-хе!"},
-    "СЪЕМ ГАДА": {"bonus": 3, "column": "I", "desc": "Зачем ты его съел?!"}
+    "СЪЕМ ГАДА": {"bonus": 3, "column": "I", "desc": "Зачем ты его съел?!"},
+    "HAPPYCOAL": {"bonus": 3, "column": "J", "desc": "Уголь успешно активирован"},
 }
 
 # Сколько очков даёт каждая редкость (можешь менять)
@@ -380,29 +381,120 @@ async def handle_spin_and_send(chat_id, user_id, context: ContextTypes.DEFAULT_T
     s_users = sheet_users()
     s_cats = sheet_cats()
 
+    # Найти пользователя (row, record). Если нет — создать.
     row, record = find_user_row(s_users, user_id)
     if record is None:
         create_new_user(s_users, user_id)
         row, record = find_user_row(s_users, user_id)
 
-    spins = int(record.get("SPINS") or 0)
+    # Текущее количество спинов
+    try:
+        spins = int(record.get("SPINS") or 0)
+    except Exception:
+        spins = 0
+
     if spins <= 0:
         await context.bot.send_message(chat_id=chat_id, text="😿 У тебя нет спинов! Получи их в разделе «Награды».")
         return
 
-    # decrease spin
-    new_spins = spins - 1
-    s_users.update([[new_spins]], f"C{row}")
+    # Получаем список всех котов из таблицы
+    try:
+        records = s_cats.get_all_records()
+        cats = clean_cat_records(records)
+    except Exception as e:
+        logger.exception("Ошибка при получении списка котов: %s", e)
+        await context.bot.send_message(chat_id=chat_id, text="⚠️ Ошибка получения каталога котов. Попробуй позже.")
+        return
 
-    # pick a cat
-    records = s_cats.get_all_records()
-    cats = clean_cat_records(records)
+    # Разбираем, какие ID уже есть у пользователя (поддерживаем разные разделители)
+    cats_id_raw = record.get("CATS_ID") or ""
+    # split по | , ; пробелам и т.п.
+    owned_tokens = [t.strip() for t in re.split(r"[|,;\\s]+", str(cats_id_raw)) if t.strip()]
+    owned_set = set(owned_tokens)
+
+    # Собираем все ID в каталоге
+    all_cat_ids = {str(c.get("id")) for c in cats if c.get("id") is not None}
+
+    # Неполученные id
+    not_owned_ids = list(all_cat_ids - owned_set)
+
+    if not not_owned_ids:
+        # Пользователь собрал всех котов — не тратим спин
+        await context.bot.send_message(chat_id=chat_id, text="🎉 У тебя уже все карточки! Спин не потрачен.")
+        return
+
+    # Выбираем редкость по весам и пытаемся найти неполученного кота в этой редкости
     rarity = choose_rarity(RARITY_WEIGHTS)
-    available = [c for c in cats if c["rarity"] == rarity]
-    chosen = random.choice(available) if available else random.choice(cats)
+    available_unowned = [c for c in cats if c["rarity"] == rarity and str(c["id"]) not in owned_set]
 
-    # transform Drive link -> uc?export=download&id=
-    url = chosen["url"]
+    if available_unowned:
+        chosen = random.choice(available_unowned)
+    else:
+        # если в выбранной редкости нет новых — выбираем случайного неполученного кота среди всех
+        unowned_cats = [c for c in cats if str(c["id"]) not in owned_set]
+        if not unowned_cats:
+            # на всякий случай (добавочная защита)
+            await context.bot.send_message(chat_id=chat_id, text="🎉 Похоже, у тебя уже все карточки. Спин не потрачен.")
+            return
+        chosen = random.choice(unowned_cats)
+        rarity = chosen["rarity"]  # скорректируем редкость для начисления очков
+
+    # --- успешно выбран неполученный кот -> теперь тратим спин и записываем изменения ---
+    new_spins = spins - 1
+    try:
+        s_users.update([[new_spins]], f"C{row}")  # values first
+    except Exception as e:
+        logger.exception("Не удалось списать спин для пользователя %s: %s", user_id, e)
+        await context.bot.send_message(chat_id=chat_id, text="⚠️ Ошибка базы: не удалось списать спин. Попробуй позже.")
+        return
+
+    # Обновляем CATS_ID (добавляем без дублей)
+    chosen_id_str = str(chosen.get("id"))
+    owned_set.add(chosen_id_str)
+    # Сортируем: по числу если возможно, иначе по строке
+    def _sort_key(x):
+        return (int(x) if x.isdigit() else float("inf"), x)
+    try:
+        sorted_ids = sorted(owned_set, key=_sort_key)
+    except Exception:
+        sorted_ids = sorted(owned_set)
+    new_cats_id = " | ".join(sorted_ids)
+    try:
+        s_users.update([[new_cats_id]], f"B{row}")
+    except Exception as e:
+        logger.exception("Не удалось обновить CATS_ID для %s: %s", user_id, e)
+        # не откатываем спин, просто логируем — можно добавить откат при желании
+
+    # Обновляем SUM (очки)
+    try:
+        sum_idx = ensure_sum_column(s_users)
+        sum_col_letter = colnum_to_letter(sum_idx)
+    except Exception as e:
+        logger.exception("Ошибка при подготовке колонки SUM: %s", e)
+        sum_col_letter = None
+
+    try:
+        current_sum_raw = record.get("SUM")
+        try:
+            current_sum = int(current_sum_raw or 0)
+        except Exception:
+            current_sum = int(str(current_sum_raw).strip() or 0)
+    except Exception:
+        current_sum = 0
+
+    gained = points_for_rarity(chosen.get("rarity"))
+    new_sum = current_sum + gained
+    if sum_col_letter:
+        try:
+            s_users.update([[new_sum]], f"{sum_col_letter}{row}")
+        except Exception as e:
+            logger.exception("Не удалось обновить SUM для %s: %s", user_id, e)
+
+    logger.info("User %s получил кот %s (редкость=%s), +%d очков, спины %d->%d",
+                user_id, chosen.get("id"), chosen.get("rarity"), gained, spins, new_spins)
+
+    # Обработка ссылки Drive -> direct download
+    url = (chosen.get("url") or "").strip()
     if "drive.google.com" in url:
         if "/d/" in url:
             file_id = url.split("/d/")[1].split("/")[0]
@@ -411,63 +503,25 @@ async def handle_spin_and_send(chat_id, user_id, context: ContextTypes.DEFAULT_T
             file_id = url.split("id=")[1].split("&")[0]
             url = f"https://drive.google.com/uc?export=download&id={file_id}"
 
-    # update CATS_ID properly with separator
-    cats_id_raw = record.get("CATS_ID")
-    cats_id = str(cats_id_raw or "").strip()
-    if cats_id:
-        cats_list = [x.strip() for x in cats_id.replace("|", ",").split(",") if x.strip()]
-        cats_list.append(str(chosen["id"]))
-        new_cats_id = " | ".join(cats_list)
-    else:
-        new_cats_id = str(chosen["id"])
-    s_users.update([[new_cats_id]], f"B{row}")
+    # Формируем подпись
+    rarity_label = RARITY_STYLES.get(chosen.get("rarity"), chosen.get("rarity"))
+    caption = f"{rarity_label}\n{chosen.get('desc')}\n\n⭐ За эту карточку: +{gained} очков"
 
-    # ---- NEW: update SUM points ----
-    # Ensure SUM column exists and get index
-    sum_idx = ensure_sum_column(s_users)  # returns 1-based index
-    sum_col_letter = colnum_to_letter(sum_idx)
-    # current sum from record (may be int, str, None)
-    current_sum_raw = record.get("SUM")
-    try:
-        current_sum = int(current_sum_raw or 0)
-    except Exception:
-        try:
-            current_sum = int(str(current_sum_raw).strip() or 0)
-        except Exception:
-            current_sum = 0
-    gained = points_for_rarity(chosen["rarity"])
-    new_sum = current_sum + gained
-    # write new SUM (values first)
-    s_users.update([[new_sum]], f"{sum_col_letter}{row}")
-    logger.info("User %s gained %d points for %s (SUM -> %d)", user_id, gained, chosen["rarity"], new_sum)
-    RARITY_STYLES = {
-        "COM": "⚪️ Обычный",
-        "UCOM": "🟢 Необычный",
-        "RARE": "🔵 Редкий",
-        "EPIC": "🟣 Эпический",
-        "LEG": "🟠 Легендарный"
-    }
-    rarity_label = RARITY_STYLES.get(chosen["rarity"], chosen["rarity"])
-
-    caption = (
-        f"{rarity_label}\n{chosen['desc']}\n\n"
-        f"⭐ За эту карточку: +{gained} очков"
-    )
-
-    # try to send image; fall back to text if fails
+    # Попытка отправить изображение по URL, затем fallback на скачивание + отправку байтов
     try:
         await context.bot.send_photo(chat_id=chat_id, photo=url, caption=caption)
-    except Exception:
-        # fallback: try downloading bytes and sending
+    except Exception as e:
+        logger.warning("send_photo по URL не удался: %s; пытаюсь скачать и отправить байты...", e)
         try:
-            import requests
             from io import BytesIO
+            import requests
             resp = requests.get(url, timeout=15)
             resp.raise_for_status()
-            photo_bytes = BytesIO(resp.content)
-            photo_bytes.name = f"cat_{chosen['id']}.jpg"
-            await context.bot.send_photo(chat_id=chat_id, photo=photo_bytes, caption=caption)
-        except Exception:
+            bio = BytesIO(resp.content)
+            bio.name = f"cat_{chosen.get('id')}.jpg"
+            await context.bot.send_photo(chat_id=chat_id, photo=bio, caption=caption)
+        except Exception as e2:
+            logger.exception("Не удалось скачать/отправить изображение: %s", e2)
             await context.bot.send_message(chat_id=chat_id, text="(Не удалось отправить изображение)\n" + caption)
 
 
