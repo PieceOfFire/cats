@@ -99,7 +99,7 @@ def sheet_users():
 
 def sheet_cats():
     client = gs_client()
-    return client.open_by_key(SPREADSHEET_KEY).worksheet("cats")
+    return client.open_by_key(SPREADSHEET_KEY).worksheet("cats2")
 
 
 def sheet_leaderboard():
@@ -658,6 +658,7 @@ threading.Thread(target=keep_alive, daemon=True).start()
 
 if __name__ == "__main__":
     main()
+
 
 
 
