@@ -99,7 +99,7 @@ def sheet_users():
 
 def sheet_cats():
     client = gs_client()
-    return client.open_by_key(SPREADSHEET_KEY).worksheet("cats2")
+    return client.open_by_key(SPREADSHEET_KEY).worksheet("cats")
 
 
 def sheet_leaderboard():
@@ -233,7 +233,7 @@ def get_main_menu_text(record=None):
     spins = 0
     if record:
         spins = int(record.get("SPINS") or 0)
-    return f"🏠 Главное меню\n💰 Баланс: {spins} спинов\nВыберите действие:"
+    return f"🏠 Главное меню\n\n💰 Баланс спинов: {spins} \nВыберите действие:"
 
 
 def get_main_menu_markup():
@@ -310,7 +310,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # show rewards menu
     if data == "rewards":
-        await query.message.edit_text("🎁 Меню наград: выбери:", reply_markup=get_rewards_markup())
+        await query.message.edit_text("🎁 Меню наград:\n выбери действие:", reply_markup=get_rewards_markup())
         return
 
     # back main
@@ -381,7 +381,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "promo_enter":
         context.user_data["awaiting_promo"] = True
         context.user_data["promo_prompt_mid"] = query.message.message_id
-        await query.message.edit_text("✏️ Введи промокод (одним сообщением). После ввода бот вернёт в главное меню.")
+        await query.message.edit_text("✏️ Введи промокод.\n После ввода бот вернёт в главное меню.")
         return
 
 
@@ -514,7 +514,7 @@ async def handle_spin_and_send(chat_id, user_id, context: ContextTypes.DEFAULT_T
 
     # Формируем подпись
     rarity_label = RARITY_STYLES.get(chosen.get("rarity"), chosen.get("rarity"))
-    caption = f"{rarity_label}\n{chosen.get('desc')}\n\n⭐ За эту карточку: +{gained} очков"
+    caption = f"{rarity_label}\n{chosen.get('desc')}\n\nЗа эту карточку: +{gained} ⭐"
 
     # Попытка отправить изображение по URL, затем fallback на скачивание + отправку байтов
     try:
@@ -562,7 +562,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             new_spins = min(spins + meta["bonus"], MAX_SPINS)
             s_users.update([[new_spins]], f"C{row}")
             s_users.update([["1"]], f"{col}{row}")
-            result_text = f"{meta['desc']}\n🎉 +{meta['bonus']} спина! Теперь у тебя {new_spins}."
+            if int(meta['bonus']) == 1: result_text = f"{meta['desc']}\n🎉 +{meta['bonus']} спин! Теперь у тебя {new_spins}."
+            else: result_text = f"{meta['desc']}\n🎉 +{meta['bonus']} спина! Теперь у тебя {new_spins}."
     else:
         result_text = "❌ Неверный промокод."
 
@@ -658,6 +659,7 @@ threading.Thread(target=keep_alive, daemon=True).start()
 
 if __name__ == "__main__":
     main()
+
 
 
 
