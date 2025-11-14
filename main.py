@@ -310,7 +310,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # show rewards menu
     if data == "rewards":
-        await query.message.edit_text("🎁 Меню наград:\n выбери действие:", reply_markup=get_rewards_markup())
+        await query.message.edit_text("🎁 Меню наград\n\n Выбери действие:", reply_markup=get_rewards_markup())
         return
 
     # back main
@@ -608,9 +608,9 @@ async def show_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
         score = r.get("SUM", 0)
         # анонимизируем: показываем место и первые 6 цифр ID (или '#N')
         uid = str(r.get("USER_ID") or "")
-        anon = f"Игрок #{uid[-6:]}" if uid else f"Игрок #{i}"
+        anon = f"Игрок #{uid[-4:]}" if uid else f"Игрок #{i}"
         medal = medals[i-1] if i-1 < len(medals) else f"{i}."
-        leaderboard_text += f"{medal} {anon} — {score} очков\n"
+        leaderboard_text += f"{medal} {anon} — {score} ⭐\n"
 
     # Найдём место текущего пользователя
     user_pos = None
@@ -659,6 +659,7 @@ threading.Thread(target=keep_alive, daemon=True).start()
 
 if __name__ == "__main__":
     main()
+
 
 
 
