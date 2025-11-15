@@ -553,24 +553,37 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if promo in PROMO_CODES:
         meta = PROMO_CODES[promo]
         col = meta["column"]
-        used = str(record.get(col) or "").strip()
-        print(type(used), used)
+
+        # === ЧИТАЕМ ПРОМО ИЗ GOOGLE SHEETS НАПРЯМУЮ ===
+        try:
+            cell_value = s_users.acell(f"{col}{row}").value or ""
+            used = str(cell_value).strip()
+        except Exception:
+            used = ""
+
         if used == "1":
             result_text = "🚫 Ты уже использовал этот промокод."
         else:
             spins = int(record.get("SPINS") or 0)
             new_spins = min(spins + meta["bonus"], MAX_SPINS)
+
+            # Обновляем спины
             s_users.update([[new_spins]], f"C{row}")
+            # Ставим отметку "1"
             s_users.update([["1"]], f"{col}{row}")
-            if int(meta['bonus']) == 1: result_text = f"{meta['desc']}\n🎉 +{meta['bonus']} спин! Теперь у тебя {new_spins}."
-            else: result_text = f"{meta['desc']}\n🎉 +{meta['bonus']} спина! Теперь у тебя {new_spins}."
+
+            if int(meta['bonus']) == 1:
+                result_text = f"{meta['desc']}\n🎉 +{meta['bonus']} спин! Теперь у тебя {new_spins}."
+            else:
+                result_text = f"{meta['desc']}\n🎉 +{meta['bonus']} спина! Теперь у тебя {new_spins}."
+
     else:
         result_text = "❌ Неверный промокод."
 
     prompt_mid = context.user_data.get("promo_prompt_mid")
+    _, new_record = find_user_row(s_users, user_id)
+
     if prompt_mid:
-        # edit prompt message into main menu + result
-        _, new_record = find_user_row(s_users, user_id)
         try:
             await context.bot.edit_message_text(
                 chat_id=chat_id,
@@ -582,7 +595,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(chat_id=chat_id, text=get_main_menu_text(new_record), reply_markup=get_main_menu_markup())
             await context.bot.send_message(chat_id=chat_id, text=result_text)
     else:
-        _, new_record = find_user_row(s_users, user_id)
         await context.bot.send_message(chat_id=chat_id, text=get_main_menu_text(new_record), reply_markup=get_main_menu_markup())
         await context.bot.send_message(chat_id=chat_id, text=result_text)
 
@@ -659,6 +671,7 @@ threading.Thread(target=keep_alive, daemon=True).start()
 
 if __name__ == "__main__":
     main()
+
 
 
 
