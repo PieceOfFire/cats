@@ -1,4 +1,4 @@
-# cats_v4_optimized.py — версия: leaderboard обновляется только по запросу
+# main_v2.py — версия с возможностью смены ника в главном меню
 import os
 import logging
 import random
@@ -35,14 +35,6 @@ BONUS_CHANNEL = "@gg_ssr"
 # Максимум спинов (если нужно ограничить)
 MAX_SPINS = 999
 
-# Промокоды (можно дополнять). Здесь указываем буквенный индекс колонки (например "G")
-PROMO_CODES = {
-    "WATERMELON": {"bonus": 3, "column": "G", "desc": "🍉 Арбуз Арбуз"},
-    "HEHE": {"bonus": 1, "column": "H", "desc": "Вот твоё бесплатное хе-хе!"},
-    "СЪЕМ ГАДА": {"bonus": 3, "column": "I", "desc": "Зачем ты его съел?!"},
-    "HAPPYCOAL": {"bonus": 3, "column": "J", "desc": "Уголь успешно активирован"},
-}
-
 # Сколько очков даёт каждая редкость (можешь менять)
 POINTS_BY_RARITY = {
     "COM": 1,
@@ -73,8 +65,15 @@ LEADERBOARD_CACHE = {
     "ts": 0,         # unix time последнего обновления
     "records": None  # список записей (rows) полученный из sheet_leaderboard().get_all_records()
 }
-LEADERBOARD_TTL = 60  # время жизни кэша в секундах (настраиваемо)
+LEADERBOARD_TTL = 10  # время жизни кэша в секундах (настраиваемо)
 leaderboard_cache_lock = asyncio.Lock()
+
+# --- Кэш для списка котов ---
+CATS_CACHE = {
+    "ts": 0,       # время последнего обновления
+    "data": None   # список котов после clean_cat_records()
+}
+CATS_TTL = 300     # 5 минут
 
 # Логирование
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
@@ -101,6 +100,35 @@ def sheet_cats():
     client = gs_client()
     return client.open_by_key(SPREADSHEET_KEY).worksheet("cats")
 
+def sheet_promo():
+    client = gs_client()
+    return client.open_by_key(SPREADSHEET_KEY).worksheet("promo")
+
+def load_promo_codes():
+    """
+    Загружает промокоды из листа promo.
+    Формат таблицы:
+    CODE | BONUS | COLUMN | DESC
+    """
+    s = sheet_promo()
+    records = s.get_all_records()
+
+    promo_dict = {}
+    for r in records:
+        code = str(r.get("CODE") or "").strip().upper()
+        bonus = int(r.get("BONUS") or 0)
+        column = str(r.get("COLUMN") or "").strip().upper()
+        desc = str(r.get("DESC") or "").strip()
+
+        if code and column:
+            promo_dict[code] = {
+                "bonus": bonus,
+                "column": column,
+                "desc": desc
+            }
+
+    return promo_dict
+
 
 def sheet_leaderboard():
     client = gs_client()
@@ -116,19 +144,45 @@ def get_today_date_iso():
     return datetime.now(NOVOSIBIRSK_TZ).date().isoformat()
 
 
-def find_user_row(sheet, user_id):
-    """Возвращает (row_index, record_dict) или (None, None)"""
-    records = sheet.get_all_records()
-    user_id_s = str(user_id)
-    for i, r in enumerate(records, start=2):
-        if str(r.get("USER_ID")) == user_id_s:
-            return i, r
-    return None, None
+def find_user_row_fast(sheet, user_id):
+    try:
+        # Ищем только в колонке USER_ID (A → column=1)
+        cell = sheet.find(str(user_id), in_column=1)
+        row = cell.row
 
+        headers = sheet.row_values(1)
+        row_values = sheet.row_values(row)
+
+        if len(row_values) < len(headers):
+            row_values += [""] * (len(headers) - len(row_values))
+
+        record = dict(zip(headers, row_values))
+        return row, record
+
+    except Exception:
+        return None, None
 
 def create_new_user(sheet, user_id):
-    """Добавляет нового пользователя: USER_ID | CATS_ID | SPINS | LAST_DAILY | SUM | SUB_GG_USED | PROM_WM"""
-    sheet.append_row([user_id, "", 3, "", 0, "", ""])
+    """
+    Добавляет нового пользователя в users с правильным порядком колонок:
+    USER_ID, NICK, CATS_ID, SPINS, LAST_DAILY, SUM, SUB_GG_USED, PROMO_WM, PROMO_HE, PROMO_GAD, PROMO_COAL
+    """
+    # начальные значения: пустой ник, пустой список котов, 3 спина по умолчанию, пустой LAST_DAILY, SUM=0,
+    # SUB_GG_USED=0, промо столбцы=0
+    row_values = [
+        user_id,   # A USER_ID
+        "",        # B NICK
+        "",        # C CATS_ID
+        3,         # D SPINS
+        "",        # E LAST_DAILY
+        0,         # F SUM
+        0,         # G SUB_GG_USED
+        0,         # H PROMO_WM
+        0,         # I PROMO_HE
+        0,         # J PROMO_GAD
+        0,         # K PROMO_COAL
+    ]
+    sheet.append_row(row_values, value_input_option="USER_ENTERED")
     return 3
 
 
@@ -139,6 +193,17 @@ def colnum_to_letter(n):
         n, rem = divmod(n - 1, 26)
         string = chr(65 + rem) + string
     return string
+
+def get_header_name_by_letter(sheet, letter):
+    """Возвращает текст заголовка (имя колонки) по букве столбца."""
+    col_index = 0
+    for char in letter.upper():
+        col_index = col_index * 26 + (ord(char) - ord('A') + 1)
+
+    headers = sheet.row_values(1)
+    if 1 <= col_index <= len(headers):
+        return headers[col_index - 1]
+    return None
 
 
 def ensure_sum_column(sheet):
@@ -231,15 +296,29 @@ async def get_leaderboard_cached():
 # --- Menu & cards ---
 def get_main_menu_text(record=None):
     spins = 0
+    nick_display = None
     if record:
-        spins = int(record.get("SPINS") or 0)
-    return f"🏠 Главное меню\n\n💰 Баланс спинов: {spins} \nВыберите действие:"
+        try:
+            spins = int(record.get("SPINS") or 0)
+        except Exception:
+            spins = 0
+        # пытаемся получить ник из поля NICK (если его нет в таблице — будет "")
+        nick = str(record.get("NICK") or "").strip()
+        if nick:
+            nick_display = nick
+        else:
+            uid = str(record.get("USER_ID") or "")
+            nick_display = f"#{uid[-4:]}" if uid else "Игрок"
+    else:
+        nick_display = "Игрок"
+    return f"🏠 Главное меню\n Имя пользователя: {nick_display}\n\n💰 Баланс: {spins} спинов\nВыберите действие:"
 
 
 def get_main_menu_markup():
     keyboard = [
         [InlineKeyboardButton("🎰 Спин", callback_data="spin")],
         [InlineKeyboardButton("🎁 Награды", callback_data="rewards")],
+        [InlineKeyboardButton("✏️ Сменить ник", callback_data="change_nick")],
         [InlineKeyboardButton("🏆 Лидерборд", callback_data="leaderboard")],
     ]
     return InlineKeyboardMarkup(keyboard)
@@ -265,6 +344,31 @@ def clean_cat_records(records):
         cleaned.append({"id": cid, "url": url, "desc": desc, "rarity": rarity})
     return cleaned
 
+def get_cats_cached():
+    """
+    Возвращает список котов (список словарей) с кэшированием на 5 минут.
+    """
+    now = time.time()
+
+    # если кэш свежий — возвращаем его
+    if CATS_CACHE["data"] is not None and (now - CATS_CACHE["ts"]) < CATS_TTL:
+        return CATS_CACHE["data"]
+
+    # иначе — загружаем из таблицы
+    s_cats = sheet_cats()
+    try:
+        records = s_cats.get_all_records()
+        cats = clean_cat_records(records)
+    except Exception as e:
+        logger.exception("Ошибка при получении списка котов: %s", e)
+        # если кэш пуст — вернём пустой список
+        return CATS_CACHE["data"] or []
+
+    # сохраняем в кэш
+    CATS_CACHE["data"] = cats
+    CATS_CACHE["ts"] = now
+    return cats
+
 
 def choose_rarity(weights):
     rarities = list(weights.keys())
@@ -280,7 +384,7 @@ def points_for_rarity(rarity: str) -> int:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     s_users = sheet_users()
-    row, record = find_user_row(s_users, user_id)
+    row, record = find_user_row_fast(s_users, user_id)
     if record is None:
         spins = create_new_user(s_users, user_id)
         record = {"SPINS": spins}
@@ -290,6 +394,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # защита: гарантируем что user_data существует
+    if context.user_data is None:
+        context.user_data = {}
+
     query = update.callback_query
     await query.answer()
     data = query.data
@@ -304,19 +412,19 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
         await handle_spin_and_send(chat_id, user_id, context)
         s_users = sheet_users()
-        _, record = find_user_row(s_users, user_id)
+        _, record = find_user_row_fast(s_users, user_id)
         await context.bot.send_message(chat_id=chat_id, text=get_main_menu_text(record), reply_markup=get_main_menu_markup())
         return
 
     # show rewards menu
     if data == "rewards":
-        await query.message.edit_text("🎁 Меню наград\n\n Выбери действие:", reply_markup=get_rewards_markup())
+        await query.message.edit_text("🎁 Меню наград: \nВыбери:", reply_markup=get_rewards_markup())
         return
 
     # back main
     if data == "back_main":
         s_users = sheet_users()
-        _, record = find_user_row(s_users, user_id)
+        _, record = find_user_row_fast(s_users, user_id)
         await query.message.edit_text(get_main_menu_text(record), reply_markup=get_main_menu_markup())
         return
 
@@ -325,11 +433,55 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # обновление leaderboard только при конкретном запросе
         await show_leaderboard(update, context)
         return
+    
+    # CHANGE NICK: use @username
+    if data == "nick_use_username":
+        usr = query.from_user
+        tg_username = usr.username  # может быть None
+
+        if not tg_username:
+            await query.message.edit_text("😿 У тебя нет @username.\nВведи ник вручную.".replace("@", "@\u200b"), reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✏️ Ввести вручную", callback_data="nick_manual")],
+                [InlineKeyboardButton("⬅️ Назад", callback_data="back_main")],
+            ]))
+            return
+
+        s_users = sheet_users()
+        row, record = find_user_row_fast(s_users, usr.id)
+
+        # ищем колонку NICK
+        headers = s_users.row_values(1)
+        nick_idx = None
+        for idx, h in enumerate(headers, start=1):
+            if str(h).strip().upper() == "NICK":
+                nick_idx = idx
+                break
+
+        if not nick_idx:
+            nick_idx = len(headers) + 1
+            s_users.update([["NICK"]], f"{colnum_to_letter(nick_idx)}1")
+
+        col_letter = colnum_to_letter(nick_idx)
+
+        s_users.update([[f"@{tg_username}"]], f"{col_letter}{row}")
+
+        _, new_record = find_user_row_fast(s_users, usr.id)
+        await query.message.edit_text(
+            get_main_menu_text(new_record) + "\n\n✨ Ник установлен через @username!".replace("@", "@\u200b"),
+            reply_markup=get_main_menu_markup()
+        )
+        return
+
+    if data == "nick_manual":
+        context.user_data["awaiting_nick"] = True
+        context.user_data["nick_prompt_mid"] = query.message.message_id
+        await query.message.edit_text("✏️ Введи новый ник (без символа @):")
+        return
 
     # daily reward
     if data == "reward_daily":
         s_users = sheet_users()
-        row, record = find_user_row(s_users, user_id)
+        row, record = find_user_row_fast(s_users, user_id)
         if record is None:
             await query.message.edit_text("😿 Ты ещё не зарегистрирован. Сначала пропиши /start.")
             return
@@ -341,18 +493,18 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             spins = int(record.get("SPINS") or 0)
             new_spins = min(spins + 1, MAX_SPINS)
-            s_users.update([[new_spins]], f"C{row}")
-            s_users.update([[today]], f"D{row}")
+            s_users.update([[new_spins]], f"D{row}")
+            s_users.update([[today]], f"E{row}")
             text = f"✨ Ты получил +1 спин! Теперь у тебя {new_spins} спинов."
 
-        _, new_record = find_user_row(s_users, user_id)
+        _, new_record = find_user_row_fast(s_users, user_id)
         await query.message.edit_text(get_main_menu_text(new_record) + "\n\n" + text, reply_markup=get_main_menu_markup())
         return
 
     # subscription reward
     if data == "reward_sub":
         s_users = sheet_users()
-        row, record = find_user_row(s_users, user_id)
+        row, record = find_user_row_fast(s_users, user_id)
         if record is None:
             await query.message.edit_text("😿 Ты ещё не зарегистрирован. Сначала пропиши /start.")
             return
@@ -367,13 +519,13 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 else:
                     spins = int(record.get("SPINS") or 0)
                     new_spins = min(spins + 3, MAX_SPINS)
-                    s_users.update([[new_spins]], f"C{row}")
-                    s_users.update([["1"]], f"F{row}")  # SUB_GG_USED
+                    s_users.update([[new_spins]], f"D{row}")
+                    s_users.update([["1"]], f"G{row}")  # SUB_GG_USED
                     text = f"🎉 Спасибо за подписку! Ты получил +3 спина. Теперь {new_spins}."
             except Exception as e:
                 text = f"⚠️ Не удалось проверить подписку: {e}"
 
-        _, new_record = find_user_row(s_users, user_id)
+        _, new_record = find_user_row_fast(s_users, user_id)
         await query.message.edit_text(get_main_menu_text(new_record) + "\n\n" + text, reply_markup=get_main_menu_markup())
         return
 
@@ -381,20 +533,29 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "promo_enter":
         context.user_data["awaiting_promo"] = True
         context.user_data["promo_prompt_mid"] = query.message.message_id
-        await query.message.edit_text("✏️ Введи промокод.\n После ввода бот вернёт в главное меню.")
+        await query.message.edit_text("✏️ Введи промокод (одним сообщением). После ввода бот вернёт в главное меню.")
+        return
+
+    # CHANGE NICK (новая логика)
+    if data == "change_nick":
+        keyboard = [
+            [InlineKeyboardButton("✨ Использовать @username", callback_data="nick_use_username")],
+            [InlineKeyboardButton("✏️ Ввести вручную", callback_data="nick_manual")],
+            [InlineKeyboardButton("⬅️ Назад", callback_data="back_main")],
+        ]
+        await query.message.edit_text("Выбери способ смены ника:", reply_markup=InlineKeyboardMarkup(keyboard))
         return
 
 
 # --- Core: handle spin, update SPINS, CATS_ID, and SUM (points) ---
 async def handle_spin_and_send(chat_id, user_id, context: ContextTypes.DEFAULT_TYPE):
     s_users = sheet_users()
-    s_cats = sheet_cats()
 
     # Найти пользователя (row, record). Если нет — создать.
-    row, record = find_user_row(s_users, user_id)
+    row, record = find_user_row_fast(s_users, user_id)
     if record is None:
         create_new_user(s_users, user_id)
-        row, record = find_user_row(s_users, user_id)
+        row, record = find_user_row_fast(s_users, user_id)
 
     # Текущее количество спинов
     try:
@@ -408,8 +569,7 @@ async def handle_spin_and_send(chat_id, user_id, context: ContextTypes.DEFAULT_T
 
     # Получаем список всех котов из таблицы
     try:
-        records = s_cats.get_all_records()
-        cats = clean_cat_records(records)
+        cats = get_cats_cached()
     except Exception as e:
         logger.exception("Ошибка при получении списка котов: %s", e)
         await context.bot.send_message(chat_id=chat_id, text="⚠️ Ошибка получения каталога котов. Попробуй позже.")
@@ -451,7 +611,7 @@ async def handle_spin_and_send(chat_id, user_id, context: ContextTypes.DEFAULT_T
     # --- успешно выбран неполученный кот -> теперь тратим спин и записываем изменения ---
     new_spins = spins - 1
     try:
-        s_users.update([[new_spins]], f"C{row}")  # values first
+        s_users.update([[new_spins]], f"D{row}", value_input_option="USER_ENTERED")
     except Exception as e:
         logger.exception("Не удалось списать спин для пользователя %s: %s", user_id, e)
         await context.bot.send_message(chat_id=chat_id, text="⚠️ Ошибка базы: не удалось списать спин. Попробуй позже.")
@@ -469,7 +629,7 @@ async def handle_spin_and_send(chat_id, user_id, context: ContextTypes.DEFAULT_T
         sorted_ids = sorted(owned_set)
     new_cats_id = " | ".join(sorted_ids)
     try:
-        s_users.update([[new_cats_id]], f"B{row}")
+        s_users.update([[new_cats_id]], f"C{row}", value_input_option="USER_ENTERED")
     except Exception as e:
         logger.exception("Не удалось обновить CATS_ID для %s: %s", user_id, e)
         # не откатываем спин, просто логируем — можно добавить откат при желании
@@ -514,7 +674,7 @@ async def handle_spin_and_send(chat_id, user_id, context: ContextTypes.DEFAULT_T
 
     # Формируем подпись
     rarity_label = RARITY_STYLES.get(chosen.get("rarity"), chosen.get("rarity"))
-    caption = f"{rarity_label}\n{chosen.get('desc')}\n\nЗа эту карточку: +{gained} ⭐"
+    caption = f"{rarity_label}\n{chosen.get('desc')}\n\n⭐ За эту карточку: +{gained} очков"
 
     # Попытка отправить изображение по URL, затем fallback на скачивание + отправку байтов
     try:
@@ -534,72 +694,123 @@ async def handle_spin_and_send(chat_id, user_id, context: ContextTypes.DEFAULT_T
             await context.bot.send_message(chat_id=chat_id, text="(Не удалось отправить изображение)\n" + caption)
 
 
-# --- Handle promo input text ---
+# --- Handle promo & nick input text ---
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.user_data.get("awaiting_promo"):
-        return
+    # Защита: гарантируем, что user_data существует
+    if context.user_data is None:
+        context.user_data = {}
 
     user_id = update.message.from_user.id
     chat_id = update.message.chat_id
-    promo = update.message.text.strip().upper()
+    text = update.message.text.strip()
 
-    s_users = sheet_users()
-    row, record = find_user_row(s_users, user_id)
-    if record is None:
-        await update.message.reply_text("😿 Ты ещё не зарегистрирован. Сначала /start.")
-        context.user_data["awaiting_promo"] = False
+    # NICK flow (высший приоритет)
+    if context.user_data.get("awaiting_nick"):
+        new_nick = text.strip()
+        context.user_data["awaiting_nick"] = False
+        prompt_mid = context.user_data.get("nick_prompt_mid")
+        # ❗ Защита: ник не должен начинаться с @ и вообще содержать @
+        if "@" in new_nick:
+            await update.message.reply_text(
+                "🚫 Ник не должен содержать символ '@'. Введи другой ник."
+            )
+            # Возвращаем пользователя снова в режим ввода ника
+            context.user_data["awaiting_nick"] = True
+            return
+
+        s_users = sheet_users()
+        row, record = find_user_row_fast(s_users, user_id)
+        if record is None:
+            await update.message.reply_text("😿 Ты ещё не зарегистрирован. Сначала /start.")
+            context.user_data["nick_prompt_mid"] = None
+            return
+        # sanitize nick (max length)
+        if len(new_nick) > 32:
+            new_nick = new_nick[:32]
+        # determine NICK column: if header exists use it, otherwise append header "NICK"
+        headers = s_users.row_values(1)
+        nick_col_idx = None
+        for idx, h in enumerate(headers, start=1):
+            if str(h).strip().upper() == "NICK":
+                nick_col_idx = idx
+                break
+        if not nick_col_idx:
+            next_idx = len(headers) + 1
+            s_users.update([["NICK"]], f"{colnum_to_letter(next_idx)}1", value_input_option="USER_ENTERED")
+            nick_col_idx = next_idx
+        nick_col_letter = colnum_to_letter(nick_col_idx)
+        try:
+            s_users.update([[new_nick]], f"{nick_col_letter}{row}", value_input_option="USER_ENTERED")
+        except Exception as e:
+            logger.exception("Не удалось записать ник: %s", e)
+            await update.message.reply_text("⚠️ Не удалось установить ник. Попробуй позже.")
+            context.user_data["nick_prompt_mid"] = None
+            return
+        # respond: edit old prompt message back to main menu if possible
+        _, new_record = find_user_row_fast(s_users, user_id)
+        if prompt_mid:
+            try:
+                await context.bot.edit_message_text(chat_id=chat_id, message_id=prompt_mid, text=get_main_menu_text(new_record), reply_markup=get_main_menu_markup())
+            except Exception:
+                await context.bot.send_message(chat_id=chat_id, text=get_main_menu_text(new_record), reply_markup=get_main_menu_markup())
+        else:
+            await context.bot.send_message(chat_id=chat_id, text=get_main_menu_text(new_record), reply_markup=get_main_menu_markup())
+        context.user_data["nick_prompt_mid"] = None
         return
 
-    if promo in PROMO_CODES:
-        meta = PROMO_CODES[promo]
-        col = meta["column"]
+    # PROMO flow
+    if context.user_data.get("awaiting_promo"):
+        promo = text.strip().upper()
+        context.user_data["awaiting_promo"] = False
+        prompt_mid = context.user_data.get("promo_prompt_mid")
+        promo_data = load_promo_codes()
+        s_users = sheet_users()
+        row, record = find_user_row_fast(s_users, user_id)
+        if record is None:
+            await update.message.reply_text("😿 Ты ещё не зарегистрирован. Сначала /start.")
+            context.user_data["promo_prompt_mid"] = None
+            return
 
-        # === ЧИТАЕМ ПРОМО ИЗ GOOGLE SHEETS НАПРЯМУЮ ===
-        try:
-            cell_value = s_users.acell(f"{col}{row}").value or ""
-            used = str(cell_value).strip()
-        except Exception:
-            used = ""
-
-        if used == "1":
-            result_text = "🚫 Ты уже использовал этот промокод."
-        else:
-            spins = int(record.get("SPINS") or 0)
-            new_spins = min(spins + meta["bonus"], MAX_SPINS)
-
-            # Обновляем спины
-            s_users.update([[new_spins]], f"C{row}")
-            # Ставим отметку "1"
-            s_users.update([["1"]], f"{col}{row}")
-
-            if int(meta['bonus']) == 1:
-                result_text = f"{meta['desc']}\n🎉 +{meta['bonus']} спин! Теперь у тебя {new_spins}."
+        if promo in promo_data:
+            meta = promo_data[promo]
+            col_letter = meta["column"].strip().upper()
+            col_header = get_header_name_by_letter(s_users, col_letter)
+            used = str(record.get(col_header) or "").strip()
+            if used == "1":
+                result_text = "🚫 Ты уже использовал этот промокод."
             else:
+                spins = int(record.get("SPINS") or 0)
+                new_spins = min(spins + meta["bonus"], MAX_SPINS)
+                s_users.update([[new_spins]], f"D{row}")
+                s_users.update([["1"]], f"{col_letter}{row}")
                 result_text = f"{meta['desc']}\n🎉 +{meta['bonus']} спина! Теперь у тебя {new_spins}."
+        else:
+            result_text = "❌ Неверный промокод."
 
-    else:
-        result_text = "❌ Неверный промокод."
-
-    prompt_mid = context.user_data.get("promo_prompt_mid")
-    _, new_record = find_user_row(s_users, user_id)
-
-    if prompt_mid:
-        try:
-            await context.bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=prompt_mid,
-                text=get_main_menu_text(new_record) + "\n\n" + result_text,
-                reply_markup=get_main_menu_markup(),
-            )
-        except Exception:
+        prompt_mid = context.user_data.get("promo_prompt_mid")
+        if prompt_mid:
+            # edit prompt message into main menu + result
+            _, new_record = find_user_row_fast(s_users, user_id)
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=prompt_mid,
+                    text=get_main_menu_text(new_record) + "\n\n" + result_text,
+                    reply_markup=get_main_menu_markup(),
+                )
+            except Exception:
+                await context.bot.send_message(chat_id=chat_id, text=get_main_menu_text(new_record), reply_markup=get_main_menu_markup())
+                await context.bot.send_message(chat_id=chat_id, text=result_text)
+        else:
+            _, new_record = find_user_row_fast(s_users, user_id)
             await context.bot.send_message(chat_id=chat_id, text=get_main_menu_text(new_record), reply_markup=get_main_menu_markup())
             await context.bot.send_message(chat_id=chat_id, text=result_text)
-    else:
-        await context.bot.send_message(chat_id=chat_id, text=get_main_menu_text(new_record), reply_markup=get_main_menu_markup())
-        await context.bot.send_message(chat_id=chat_id, text=result_text)
 
-    context.user_data["awaiting_promo"] = False
-    context.user_data["promo_prompt_mid"] = None
+        context.user_data["promo_prompt_mid"] = None
+        return
+
+    # если не промо/ник — игнорируем текст
+    return
 
 
 async def show_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -620,9 +831,11 @@ async def show_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
         score = r.get("SUM", 0)
         # анонимизируем: показываем место и первые 6 цифр ID (или '#N')
         uid = str(r.get("USER_ID") or "")
-        anon = f"Игрок #{uid[-4:]}" if uid else f"Игрок #{i}"
+        # используем NICK, если он есть
+        nick = (r.get("NICK") or "").strip()
+        display = nick if nick else (f"Игрок #{uid[-6:]}" if uid else f"Игрок #{i}")
         medal = medals[i-1] if i-1 < len(medals) else f"{i}."
-        leaderboard_text += f"{medal} {anon} — {score} ⭐\n"
+        leaderboard_text += f"{medal} {display} — {score} очков\n"
 
     # Найдём место текущего пользователя
     user_pos = None
@@ -640,6 +853,7 @@ async def show_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     keyboard = [[InlineKeyboardButton("⬅️ Назад", callback_data="back_main")]]
     await query.message.edit_text(leaderboard_text, reply_markup=InlineKeyboardMarkup(keyboard))
+
 
 async def reload_leaderboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async with leaderboard_cache_lock:
@@ -671,10 +885,3 @@ threading.Thread(target=keep_alive, daemon=True).start()
 
 if __name__ == "__main__":
     main()
-
-
-
-
-
-
-
