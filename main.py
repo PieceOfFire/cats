@@ -1,10 +1,11 @@
-# main_v2.py — версия с возможностью смены ника в главном меню
+# main_v3.py — стрик + оптимизация
 import os
 import logging
 import random
-from datetime import datetime
+from datetime import datetime, timedelta
 import pytz
 import time
+import time as _time
 import asyncio
 import os
 import json
@@ -12,6 +13,7 @@ import threading
 import http.server
 import socketserver
 import re
+import aiohttp
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
@@ -26,16 +28,13 @@ from telegram.ext import (
 import gspread
 from google.oauth2.service_account import Credentials
 
-# --- Настройки: замените на свои ---
+# --- Настройки ---
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 SPREADSHEET_KEY = os.environ["SPREADSHEET_KEY"]
 CREDENTIALS_FILE = "/etc/secrets/cats-476112-9a44bf3e38e2.json"
 BONUS_CHANNEL = "@gg_ssr"
 
-# Максимум спинов (если нужно ограничить)
 MAX_SPINS = 999
-
-# Сколько очков даёт каждая редкость (можешь менять)
 POINTS_BY_RARITY = {
     "COM": 1,
     "UCOM": 3,
@@ -78,6 +77,7 @@ CATS_TTL = 300     # 5 минут
 # Логирование
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 # Часовой пояс Новосибирска
 NOVOSIBIRSK_TZ = pytz.timezone("Asia/Novosibirsk")
@@ -103,6 +103,46 @@ def sheet_cats():
 def sheet_promo():
     client = gs_client()
     return client.open_by_key(SPREADSHEET_KEY).worksheet("promo")
+
+def sheet_leaderboard():
+    client = gs_client()
+    wb = client.open_by_key(SPREADSHEET_KEY)
+    try:
+        return wb.worksheet("leaderboard")
+    except Exception:
+        return None
+
+def make_streak_bar(streak: int) -> str:
+    bar = []
+    streak = streak % 5
+    if streak == 0:
+        streak = 5
+    for i in range(1, 6):
+        if streak >= i:
+            if i <= 4:
+                bar.append("🟩")
+            else:
+                bar.append("🎁")
+        else:
+            bar.append("⬜")
+    return "".join(bar)
+
+def make_super_grid(counts_by_reward: dict):
+    """
+    counts_by_reward: {3: count_of_3s, 2: count_of_2s, 1: count_of_1s}
+    Возвращает список длины 9 с распределением и перемешанный.
+    """
+    grid = []
+    for reward, cnt in counts_by_reward.items():
+        grid += [int(reward)] * int(cnt)
+    # дополним +1, если вдруг менее 9
+    while len(grid) < 9:
+        grid.append(1)
+    # если больше — усечём
+    if len(grid) > 9:
+        grid = grid[:9]
+    random.shuffle(grid)
+    return grid
 
 def load_promo_codes():
     """
@@ -130,13 +170,7 @@ def load_promo_codes():
     return promo_dict
 
 
-def sheet_leaderboard():
-    client = gs_client()
-    wb = client.open_by_key(SPREADSHEET_KEY)
-    try:
-        return wb.worksheet("leaderboard")
-    except Exception:
-        return None
+
 
 
 # --- Utility functions ---
@@ -175,12 +209,8 @@ def create_new_user(sheet, user_id):
         "",        # C CATS_ID
         3,         # D SPINS
         "",        # E LAST_DAILY
-        0,         # F SUM
-        0,         # G SUB_GG_USED
-        0,         # H PROMO_WM
-        0,         # I PROMO_HE
-        0,         # J PROMO_GAD
-        0,         # K PROMO_COAL
+        0,         # F STREAK  ← добавили
+        0,         # G SUM
     ]
     sheet.append_row(row_values, value_input_option="USER_ENTERED")
     return 3
@@ -205,6 +235,17 @@ def get_header_name_by_letter(sheet, letter):
         return headers[col_index - 1]
     return None
 
+def column_letter_by_name(sheet, name):
+    """Находит букву колонки по имени (header)"""
+    headers = sheet.row_values(1)
+    for idx, h in enumerate(headers, start=1):
+        if str(h).strip().upper() == name.upper():
+            return colnum_to_letter(idx)
+    # если нет — добавляем в конец
+    next_idx = len(headers) + 1
+    sheet.update([[name]], f"{colnum_to_letter(next_idx)}1")
+    return colnum_to_letter(next_idx)
+
 
 def ensure_sum_column(sheet):
     """
@@ -221,33 +262,6 @@ def ensure_sum_column(sheet):
     next_idx = len(headers) + 1
     sheet.update([["SUM"]], f"{colnum_to_letter(next_idx)}1")
     return next_idx
-
-
-def ensure_leaderboard_sheet():
-    """
-    Создаёт или обновляет лист 'leaderboard' с формулой SORT(users!A1:<LASTCOL>; <SUM_IDX>; FALSE).
-    Возвращает Worksheet leaderboard.
-    """
-    client = gs_client()
-    wb = client.open_by_key(SPREADSHEET_KEY)
-    users = wb.worksheet("users")
-    headers = users.row_values(1)
-    if not headers:
-        # если нет заголовков — ничего не делаем
-        raise RuntimeError("Sheet 'users' пуст или не содержит заголовков")
-    sum_idx = ensure_sum_column(users)
-    last_col_idx = max(len(headers), sum_idx)
-    last_col_letter = colnum_to_letter(last_col_idx)
-    # формула динамически
-    # используем локаль с ';' как у тебя; если у тебя EN, замени на ','
-    sort_formula = f"=SORT(users!A1:{last_col_letter}; {sum_idx}; FALSE)"
-    try:
-        lb = wb.worksheet("leaderboard")
-        lb.update([[sort_formula]], "A1", value_input_option="USER_ENTERED")
-    except Exception:
-        lb = wb.add_worksheet(title="leaderboard", rows="100", cols=str(last_col_idx))
-        lb.update([[sort_formula]], "A1", value_input_option="USER_ENTERED")
-    return lb
 
 async def get_leaderboard_cached():
     """
@@ -266,13 +280,6 @@ async def get_leaderboard_cached():
         now = time.time()
         if LEADERBOARD_CACHE["records"] is not None and (now - LEADERBOARD_CACHE["ts"]) < LEADERBOARD_TTL:
             return LEADERBOARD_CACHE["records"]
-
-        # Обновляем/создаём лист leaderboard (вставляет формулу в A1)
-        try:
-            ensure_leaderboard_sheet()
-        except Exception as e:
-            # не фатально — логируем и пробуем всё же прочитать существующий лист
-            logger.warning("Не удалось подготовить leaderboard перед чтением: %s", e)
 
         # читаем данные из leaderboard
         try:
@@ -308,7 +315,7 @@ def get_main_menu_text(record=None):
             nick_display = nick
         else:
             uid = str(record.get("USER_ID") or "")
-            nick_display = f"#{uid[-4:]}" if uid else "Игрок"
+            nick_display = f"#{uid[-6:]}" if uid else "Игрок"
     else:
         nick_display = "Игрок"
     return f"🏠 Главное меню\n Имя пользователя: {nick_display}\n\n💰 Баланс: {spins} спинов\nВыберите действие:"
@@ -389,7 +396,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         spins = create_new_user(s_users, user_id)
         record = {"SPINS": spins}
     main_text = get_main_menu_text(record)
-    # не обновляем leaderboard автоматически здесь (по оптимизации)
     await update.message.reply_text(main_text, reply_markup=get_main_menu_markup())
 
 
@@ -418,7 +424,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # show rewards menu
     if data == "rewards":
-        await query.message.edit_text("🎁 Меню наград: \nВыбери:", reply_markup=get_rewards_markup())
+        await query.message.edit_text("🎁 Меню наград \n\nВыбери:", reply_markup=get_rewards_markup())
         return
 
     # back main
@@ -488,17 +494,123 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         today = get_today_date_iso()
         last_daily = record.get("LAST_DAILY") or ""
+        streak = int(record.get("STREAK") or 0)
+
+        # --- Проверка стрика ---
         if last_daily == today:
-            text = f"🐾 Ты уже брал ежедневную награду сегодня! Баланс: {int(record.get('SPINS') or 0)} спинов."
+            reward = 0
+            text = f"🐾 Ты уже получил ежедневную награду сегодня!\n\nТвой стрик: {streak}"
         else:
+            # Определяем — был ли вчера
+            yesterday = (datetime.now(NOVOSIBIRSK_TZ).date().fromisoformat(today))
+            yesterday = (datetime.now(NOVOSIBIRSK_TZ).date() - timedelta(days=1)).isoformat()
+
+            if last_daily == yesterday:
+                streak += 1
+            else:
+                streak = 1
+
+            spin_end = 'спина'
+            # Награда по схеме 1 1 1 2 2 2 3
+            if streak <= 3:
+                reward = 1
+                spin_end = 'спин'
+            elif streak <= 6:
+                reward = 2
+            else:
+                reward = 3
+
+            # Обновляем SPINS
             spins = int(record.get("SPINS") or 0)
-            new_spins = min(spins + 1, MAX_SPINS)
-            s_users.update([[new_spins]], f"D{row}")
-            s_users.update([[today]], f"E{row}")
-            text = f"✨ Ты получил +1 спин! Теперь у тебя {new_spins} спинов."
+            new_spins = min(spins + reward, MAX_SPINS)
+
+            spin_col = column_letter_by_name(s_users, "SPINS")
+            steak_col = column_letter_by_name(s_users, "STREAK")
+            day_col = column_letter_by_name(s_users, "LAST_DAILY")
+
+            s_users.update([[new_spins]], f"{spin_col}{row}", value_input_option="USER_ENTERED")
+            s_users.update([[streak]], f"{steak_col}{row}", value_input_option="USER_ENTERED")
+            s_users.update([[today]], f"{day_col}{row}", value_input_option="USER_ENTERED")
+
+            if streak % 5 == 0:
+                # отправляем супер-игру
+                await offer_super_game(chat_id, user_id, context, s_users, row, streak, message_obj=query.message)
+                return
+            dop_words = ""
+            if streak == 3:
+                dop_words = "\n\nЗавтра будет +2, продолжай в том же духе!"
+            elif streak == 6:
+                dop_words = "\n\nЗавтра будет +3, не останавливайся!"
+            elif (streak%5) == 4:
+                dop_words = "\n\n🔔 Завтра будет СУПЕР-ИГРА! Не забудь зайти!"
+
+            streak_bar = make_streak_bar(streak)
+            text = (
+                f"✨ Ты получил ежедневную награду!\n"
+                f"Награда: +{reward} {spin_end}\n"
+                f"Твой Стрик: {streak}\n{streak_bar}{dop_words}"
+            )
 
         _, new_record = find_user_row_fast(s_users, user_id)
         await query.message.edit_text(get_main_menu_text(new_record) + "\n\n" + text, reply_markup=get_main_menu_markup())
+        return
+
+    # супер-игра — выбор клетки
+    if data.startswith("super_pick:"):
+        idx = int(data.split(":", 1)[1])
+        sg = context.user_data.get("super_game")
+        if not sg or sg.get("user_id") != user_id:
+            await query.answer("Нет активной супер-игры или она принадлежит другому игроку.", show_alert=True)
+            return
+
+        if sg.get("picked"):
+            await query.answer("Ты уже сделал выбор.", show_alert=True)
+            return
+
+        grid = sg["grid"]
+        if idx < 0 or idx >= len(grid):
+            await query.answer("Неверный выбор.", show_alert=True)
+            return
+
+        # помечаем как выбранное
+        sg["picked"] = True
+        chosen_reward = int(grid[idx])
+
+        # — Начисляем спины в таблице (без переполнения MAX_SPINS)
+        try:
+            s_users_local = sheet_users()
+            # row уже хранится в sg (если была передана)
+            row_for_user = sg.get("row")
+            if not row_for_user:
+                # fallback: найти строку
+                row_for_user, rec = find_user_row_fast(s_users_local, user_id)
+            # текущее количество спинов (с безопасным парсингом)
+            _, rec = find_user_row_fast(s_users_local, user_id)
+            current_spins = int(rec.get("SPINS") or 0)
+            new_spins = min(current_spins + chosen_reward, MAX_SPINS)
+            spin_col = column_letter_by_name(s_users_local, "SPINS")
+            s_users_local.update([[new_spins]], f"{spin_col}{row_for_user}", value_input_option="USER_ENTERED")
+        except Exception as e:
+            logger.exception("Ошибка при начислении супер-спинов: %s", e)
+            await query.answer("Ошибка начисления. Попробуй позже.", show_alert=True)
+            # опционально: откат picked = False
+            sg["picked"] = False
+            return
+
+        # Редактируем сообщение — показываем раскрытое поле и результат
+
+        if chosen_reward == 1:
+            spin_word = "спин"
+        else:
+            spin_word = "спина" 
+        try:
+            reveal_text = f"Ты получаешь: +{chosen_reward} {spin_word}!\n\nПоле открыто:"
+            await query.message.edit_text(reveal_text, reply_markup=build_super_markup(hidden=False, grid=grid, chosen_idx=idx))
+        except Exception:
+            # возможно, message_id устарел — просто отправим новое сообщение
+            await context.bot.send_message(chat_id=query.message.chat_id, text=f"Ты выбрал: +{chosen_reward} спина!")
+        # очистим state через небольшую паузу (или сразу)
+        context.user_data.pop("super_game", None)
         return
 
     # subscription reward
@@ -519,8 +631,11 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 else:
                     spins = int(record.get("SPINS") or 0)
                     new_spins = min(spins + 3, MAX_SPINS)
-                    s_users.update([[new_spins]], f"D{row}")
-                    s_users.update([["1"]], f"G{row}")  # SUB_GG_USED
+                    spin_col = column_letter_by_name(s_users, "SPINS")
+                    sub_col = column_letter_by_name(s_users, "SUB_GG_USED")
+                    s_users.update([[new_spins]], f"{spin_col}{row}")
+                    s_users.update([["1"]], f"{sub_col}{row}")
+
                     text = f"🎉 Спасибо за подписку! Ты получил +3 спина. Теперь {new_spins}."
             except Exception as e:
                 text = f"⚠️ Не удалось проверить подписку: {e}"
@@ -636,8 +751,7 @@ async def handle_spin_and_send(chat_id, user_id, context: ContextTypes.DEFAULT_T
 
     # Обновляем SUM (очки)
     try:
-        sum_idx = ensure_sum_column(s_users)
-        sum_col_letter = colnum_to_letter(sum_idx)
+        sum_col_letter = column_letter_by_name(s_users, "SUM")
     except Exception as e:
         logger.exception("Ошибка при подготовке колонки SUM: %s", e)
         sum_col_letter = None
@@ -674,7 +788,7 @@ async def handle_spin_and_send(chat_id, user_id, context: ContextTypes.DEFAULT_T
 
     # Формируем подпись
     rarity_label = RARITY_STYLES.get(chosen.get("rarity"), chosen.get("rarity"))
-    caption = f"{rarity_label}\n{chosen.get('desc')}\n\n⭐ За эту карточку: +{gained} очков"
+    caption = f"{rarity_label}\n{chosen.get('desc')}\n\n⭐ За эту карточку: +{gained} ⭐"
 
     # Попытка отправить изображение по URL, затем fallback на скачивание + отправку байтов
     try:
@@ -683,12 +797,19 @@ async def handle_spin_and_send(chat_id, user_id, context: ContextTypes.DEFAULT_T
         logger.warning("send_photo по URL не удался: %s; пытаюсь скачать и отправить байты...", e)
         try:
             from io import BytesIO
-            import requests
-            resp = requests.get(url, timeout=15)
-            resp.raise_for_status()
-            bio = BytesIO(resp.content)
+
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=15) as resp:
+                    if resp.status != 200:
+                        raise Exception(f"HTTP {resp.status}")
+
+                    content = await resp.read()
+
+            bio = BytesIO(content)
             bio.name = f"cat_{chosen.get('id')}.jpg"
+
             await context.bot.send_photo(chat_id=chat_id, photo=bio, caption=caption)
+
         except Exception as e2:
             logger.exception("Не удалось скачать/отправить изображение: %s", e2)
             await context.bot.send_message(chat_id=chat_id, text="(Не удалось отправить изображение)\n" + caption)
@@ -812,6 +933,78 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # если не промо/ник — игнорируем текст
     return
 
+def build_super_markup(hidden=True, grid=None, chosen_idx=None):
+    """
+    Возвращает InlineKeyboardMarkup для 3x3.
+    - hidden=True: все кнопки выглядят "❓" (callback = super_pick:{i}).
+    - hidden=False: показываем значения и добавляем внизу кнопку "⬅️ В главное меню".
+    - chosen_idx — выделенная клетка (0..8).
+    """
+    keyboard = []
+    for r in range(3):
+        row_buttons = []
+        for c in range(3):
+            i = r * 3 + c
+            if hidden:
+                text = "❓"
+            else:
+                sym = "🟢🔵🟣"
+                val = int(grid[i])
+                val = sym[val-1]  # заменяем цифру на цветной кружок
+                prefix = "👉" if (chosen_idx is not None and i == chosen_idx) else ""
+                text = f"{prefix} {val}"
+            row_buttons.append(InlineKeyboardButton(text, callback_data=f"super_pick:{i}"))
+        keyboard.append(row_buttons)
+
+    # Если поле раскрыто — добавляем внизу кнопку возврата в главное меню
+    if not hidden:
+        keyboard.append([InlineKeyboardButton("⬅️ В главное меню", callback_data="back_main")])
+
+    return InlineKeyboardMarkup(keyboard)
+
+async def offer_super_game(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE, s_users, row, streak: int, message_obj=None):
+    """
+    Создаёт поле 3x3, сохраняет state в context.user_data и выводит его.
+    Если передан message_obj (например query.message) — редактируем его.
+    """
+    # распределение (можно менять)
+    distribution = {3: 1, 2: 3, 1: 5}
+    grid = make_super_grid(distribution)
+
+    # store state
+    context.user_data["super_game"] = {
+        "grid": grid,
+        "created_at": _time.time(),
+        "picked": False,
+        "row": row,
+        "user_id": user_id,
+    }
+
+    streak_bar = make_streak_bar(streak)
+
+    prompt = (
+        f"🎉 Супер-игра!\n\nТвой стрик: {streak}\n{streak_bar}\n\nВыбери одну из 9 клеток.\n🟢 +1 спин, 🔵 +2 спина, 🟣 +3 спина."
+    )
+
+    # Если есть объект сообщения — редактируем его (чтобы не оставлять старое меню),
+    # иначе отправляем новое сообщение (на всякий случай).
+    try:
+        if message_obj is not None:
+            await message_obj.edit_text(prompt, reply_markup=build_super_markup(hidden=True, grid=grid))
+            # сохраним message_id для дальнейшего редактирования
+            context.user_data["super_game"]["message_id"] = message_obj.message_id
+            context.user_data["super_game"]["chat_id"] = message_obj.chat_id
+        else:
+            sent = await context.bot.send_message(chat_id=chat_id, text=prompt, reply_markup=build_super_markup(hidden=True, grid=grid))
+            context.user_data["super_game"]["message_id"] = sent.message_id
+            context.user_data["super_game"]["chat_id"] = sent.chat_id
+    except Exception as e:
+        logger.exception("Не удалось показать супер-игру: %s", e)
+        # fallback: отправим отдельное сообщение
+        sent = await context.bot.send_message(chat_id=chat_id, text=prompt, reply_markup=build_super_markup(hidden=True, grid=grid))
+        context.user_data["super_game"]["message_id"] = sent.message_id
+        context.user_data["super_game"]["chat_id"] = sent.chat_id
+
 
 async def show_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -835,7 +1028,7 @@ async def show_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
         nick = (r.get("NICK") or "").strip()
         display = nick if nick else (f"Игрок #{uid[-6:]}" if uid else f"Игрок #{i}")
         medal = medals[i-1] if i-1 < len(medals) else f"{i}."
-        leaderboard_text += f"{medal} {display} — {score} очков\n"
+        leaderboard_text += f"{medal} {display} — {score} ⭐\n"
 
     # Найдём место текущего пользователя
     user_pos = None
@@ -847,7 +1040,7 @@ async def show_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
             break
 
     if user_pos:
-        leaderboard_text += f"\n📍 Твоё место: {user_pos}-е, {user_sum} очков"
+        leaderboard_text += f"\n📍 Твоё место: {user_pos}-е, {user_sum} ⭐"
     else:
         leaderboard_text += "\n😿 Ты пока не в рейтинге. Попробуй сделать спин!"
 
