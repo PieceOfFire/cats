@@ -968,7 +968,7 @@ async def offer_super_game(chat_id: int, user_id: int, context: ContextTypes.DEF
     Если передан message_obj (например query.message) — редактируем его.
     """
     # распределение (можно менять)
-    distribution = {3: 1, 2: 3, 1: 5}
+    distribution = {5: 1, 3: 3, 2: 5}
     grid = make_super_grid(distribution)
 
     # store state
@@ -1078,3 +1078,4 @@ threading.Thread(target=keep_alive, daemon=True).start()
 
 if __name__ == "__main__":
     main()
+
