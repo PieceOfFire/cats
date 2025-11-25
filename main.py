@@ -599,10 +599,11 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Редактируем сообщение — показываем раскрытое поле и результат
 
-        if chosen_reward == 1:
-            spin_word = "спин"
+        if chosen_reward == 5:
+            spin_word = "спинов"
         else:
             spin_word = "спина" 
+
         try:
             reveal_text = f"Ты получаешь: +{chosen_reward} {spin_word}!\n\nПоле открыто:"
             await query.message.edit_text(reveal_text, reply_markup=build_super_markup(hidden=False, grid=grid, chosen_idx=idx))
@@ -948,9 +949,13 @@ def build_super_markup(hidden=True, grid=None, chosen_idx=None):
             if hidden:
                 text = "❓"
             else:
-                sym = "🟢🔵🟣"
                 val = int(grid[i])
-                val = sym[val-1]  # заменяем цифру на цветной кружок
+                if val == 2:
+                    val = '🟢'
+                elif val == 3:
+                    val = '🔵'
+                elif val == 5:
+                    val = '🟣'
                 prefix = "👉" if (chosen_idx is not None and i == chosen_idx) else ""
                 text = f"{prefix} {val}"
             row_buttons.append(InlineKeyboardButton(text, callback_data=f"super_pick:{i}"))
@@ -983,7 +988,7 @@ async def offer_super_game(chat_id: int, user_id: int, context: ContextTypes.DEF
     streak_bar = make_streak_bar(streak)
 
     prompt = (
-        f"🎉 Супер-игра!\n\nТвой стрик: {streak}\n{streak_bar}\n\nВыбери одну из 9 клеток.\n🟢 +1 спин, 🔵 +2 спина, 🟣 +3 спина."
+        f"🎉 Супер-игра!\n\nТвой стрик: {streak}\n{streak_bar}\n\nВыбери одну из 9 клеток.\n🟢 +2 спин, 🔵 +3 спина, 🟣 +5 спина."
     )
 
     # Если есть объект сообщения — редактируем его (чтобы не оставлять старое меню),
