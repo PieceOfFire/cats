@@ -1,3 +1,6 @@
+import winter
+import winter_frame
+
 # main_v3.py — стрик + оптимизация
 import os
 import logging
@@ -29,10 +32,10 @@ import gspread
 from google.oauth2.service_account import Credentials
 
 # --- Настройки ---
+BONUS_CHANNEL = "@gg_ssr"
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 SPREADSHEET_KEY = os.environ["SPREADSHEET_KEY"]
 CREDENTIALS_FILE = "/etc/secrets/cats-476112-9a44bf3e38e2.json"
-BONUS_CHANNEL = "@gg_ssr"
 
 MAX_SPINS = 999
 POINTS_BY_RARITY = {
@@ -321,14 +324,17 @@ def get_main_menu_text(record=None):
     return f"🏠 Главное меню\n Имя пользователя: {nick_display}\n\n💰 Баланс: {spins} спинов\nВыберите действие:"
 
 
-def get_main_menu_markup():
+def get_main_menu_markup(is_admin: bool = False):
     keyboard = [
         [InlineKeyboardButton("🎰 Спин", callback_data="spin")],
         [InlineKeyboardButton("🎁 Награды", callback_data="rewards")],
         [InlineKeyboardButton("✏️ Сменить ник", callback_data="change_nick")],
         [InlineKeyboardButton("🏆 Лидерборд", callback_data="leaderboard")],
     ]
+    # показываем кнопку входа в новогодний режим всем пользователям
+    keyboard.append([InlineKeyboardButton("❄️ Новогодний режим", callback_data="winter_main")])
     return InlineKeyboardMarkup(keyboard)
+
 
 
 def get_rewards_markup():
@@ -396,7 +402,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         spins = create_new_user(s_users, user_id)
         record = {"SPINS": spins}
     main_text = get_main_menu_text(record)
-    await update.message.reply_text(main_text, reply_markup=get_main_menu_markup())
+    is_admin = update.effective_user and update.effective_user.id == getattr(winter, "ADMIN_ID", None)
+    await update.message.reply_text(main_text, reply_markup=get_main_menu_markup(is_admin=is_admin))
+
 
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -405,10 +413,24 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data = {}
 
     query = update.callback_query
+    # guard: иногда update может быть message, тогда callback_query будет None
+    if query is None:
+        return
     await query.answer()
+
     data = query.data
+
+    # Сразу получаем chat_id и user_id — чтобы не использовать их до присвоения
     chat_id = query.message.chat_id
     user_id = query.from_user.id
+
+    # определяем, админ ли текущий пользователь (используем winter.ADMIN_ID)
+    is_admin = user_id == getattr(winter, "ADMIN_ID", None)
+
+    # Если winter-back пришёл в качестве callback от winter-модуля, делаем его равным back_main
+    # (это позволяет основной логике обрабатывать возврат в главное меню)
+    if data == "winter_back_main":
+        data = "back_main"
 
     # SPIN: удалить текущее меню, выдать фото, отправить новое главное меню
     if data == "spin":
@@ -419,7 +441,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await handle_spin_and_send(chat_id, user_id, context)
         s_users = sheet_users()
         _, record = find_user_row_fast(s_users, user_id)
-        await context.bot.send_message(chat_id=chat_id, text=get_main_menu_text(record), reply_markup=get_main_menu_markup())
+        await context.bot.send_message(chat_id=chat_id, text=get_main_menu_text(record), reply_markup=get_main_menu_markup(is_admin=is_admin))
         return
 
     # show rewards menu
@@ -431,7 +453,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "back_main":
         s_users = sheet_users()
         _, record = find_user_row_fast(s_users, user_id)
-        await query.message.edit_text(get_main_menu_text(record), reply_markup=get_main_menu_markup())
+        await query.message.edit_text(get_main_menu_text(record), reply_markup=get_main_menu_markup(is_admin=is_admin))
         return
 
     # leaderboard
@@ -439,7 +461,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # обновление leaderboard только при конкретном запросе
         await show_leaderboard(update, context)
         return
-    
+
     # CHANGE NICK: use @username
     if data == "nick_use_username":
         usr = query.from_user
@@ -474,7 +496,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _, new_record = find_user_row_fast(s_users, usr.id)
         await query.message.edit_text(
             get_main_menu_text(new_record) + "\n\n✨ Ник установлен через @username!".replace("@", "@\u200b"),
-            reply_markup=get_main_menu_markup()
+            reply_markup=get_main_menu_markup(is_admin=is_admin)
         )
         return
 
@@ -502,7 +524,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text = f"🐾 Ты уже получил ежедневную награду сегодня!\n\nТвой стрик: {streak}"
         else:
             # Определяем — был ли вчера
-            yesterday = (datetime.now(NOVOSIBIRSK_TZ).date().fromisoformat(today))
             yesterday = (datetime.now(NOVOSIBIRSK_TZ).date() - timedelta(days=1)).isoformat()
 
             if last_daily == yesterday:
@@ -552,8 +573,119 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
         _, new_record = find_user_row_fast(s_users, user_id)
-        await query.message.edit_text(get_main_menu_text(new_record) + "\n\n" + text, reply_markup=get_main_menu_markup())
+        await query.message.edit_text(get_main_menu_text(new_record) + "\n\n" + text, reply_markup=get_main_menu_markup(is_admin=is_admin))
         return
+
+    # супер-игра — выбор клетки
+    if data.startswith("super_pick:"):
+        idx = int(data.split(":", 1)[1])
+        sg = context.user_data.get("super_game")
+        if not sg or sg.get("user_id") != user_id:
+            await query.answer("Нет активной супер-игры или она принадлежит другому игроку.", show_alert=True)
+            return
+
+        if sg.get("picked"):
+            await query.answer("Ты уже сделал выбор.", show_alert=True)
+            return
+
+        grid = sg["grid"]
+        if idx < 0 or idx >= len(grid):
+            await query.answer("Неверный выбор.", show_alert=True)
+            return
+
+        # помечаем как выбранное
+        sg["picked"] = True
+        chosen_reward = int(grid[idx])
+
+        # — Начисляем спины в таблице (без переполнения MAX_SPINS)
+        try:
+            s_users_local = sheet_users()
+            # row уже хранится в sg (если была передана)
+            row_for_user = sg.get("row")
+            if not row_for_user:
+                # fallback: найти строку
+                row_for_user, rec = find_user_row_fast(s_users_local, user_id)
+            # текущее количество спинов (с безопасным парсингом)
+            _, rec = find_user_row_fast(s_users_local, user_id)
+            current_spins = int(rec.get("SPINS") or 0)
+            new_spins = min(current_spins + chosen_reward, MAX_SPINS)
+            spin_col = column_letter_by_name(s_users_local, "SPINS")
+            s_users_local.update([[new_spins]], f"{spin_col}{row_for_user}", value_input_option="USER_ENTERED")
+        except Exception as e:
+            logger.exception("Ошибка при начислении супер-спинов: %s", e)
+            await query.answer("Ошибка начисления. Попробуй позже.", show_alert=True)
+            # опционально: откат picked = False
+            sg["picked"] = False
+            return
+
+        # Редактируем сообщение — показываем раскрытое поле и результат
+
+        if chosen_reward == 5:
+            spin_word = "спинов"
+        else:
+            spin_word = "спина"
+
+        try:
+            reveal_text = f"Ты получаешь: +{chosen_reward} {spin_word}!\n\nПоле открыто:"
+            await query.message.edit_text(reveal_text, reply_markup=build_super_markup(hidden=False, grid=grid, chosen_idx=idx))
+        except Exception:
+            # возможно, message_id устарел — просто отправим новое сообщение
+            await context.bot.send_message(chat_id=query.message.chat_id, text=f"Ты выбрал: +{chosen_reward} спина!")
+        # очистим state через небольшую паузу (или сразу)
+        context.user_data.pop("super_game", None)
+        return
+
+    # subscription reward
+    if data == "reward_sub":
+        s_users = sheet_users()
+        row, record = find_user_row_fast(s_users, user_id)
+        if record is None:
+            await query.message.edit_text("😿 Ты ещё не зарегистрирован. Сначала пропиши /start.")
+            return
+
+        if str(record.get("SUB_GG_USED") or "").strip() == "1":
+            text = "🎁 Ты уже получал награду за подписку."
+        else:
+            try:
+                member = await context.bot.get_chat_member(chat_id=BONUS_CHANNEL, user_id=user_id)
+                if member.status not in ("member", "administrator", "creator"):
+                    text = f"😿 Ты не подписан на {BONUS_CHANNEL}. Подпишись и попробуй снова."
+                else:
+                    spins = int(record.get("SPINS") or 0)
+                    new_spins = min(spins + 3, MAX_SPINS)
+                    spin_col = column_letter_by_name(s_users, "SPINS")
+                    sub_col = column_letter_by_name(s_users, "SUB_GG_USED")
+                    s_users.update([[new_spins]], f"{spin_col}{row}")
+                    s_users.update([["1"]], f"{sub_col}{row}")
+
+                    text = f"🎉 Спасибо за подписку! Ты получил +3 спина. Теперь {new_spins}."
+            except Exception as e:
+                text = f"⚠️ Не удалось проверить подписку: {e}"
+
+        _, new_record = find_user_row_fast(s_users, user_id)
+        await query.message.edit_text(get_main_menu_text(new_record) + "\n\n" + text, reply_markup=get_main_menu_markup(is_admin=is_admin))
+        return
+
+    # enter promo
+    if data == "promo_enter":
+        context.user_data["awaiting_promo"] = True
+        context.user_data["promo_prompt_mid"] = query.message.message_id
+        await query.message.edit_text("✏️ Введи промокод (одним сообщением). После ввода бот вернёт в главное меню.")
+        return
+
+    # CHANGE NICK (новая логика)
+    if data == "change_nick":
+        keyboard = [
+            [InlineKeyboardButton("✨ Использовать @username", callback_data="nick_use_username")],
+            [InlineKeyboardButton("✏️ Ввести вручную", callback_data="nick_manual")],
+            [InlineKeyboardButton("⬅️ Назад", callback_data="back_main")],
+        ]
+        await query.message.edit_text("Выбери способ смены ника:", reply_markup=InlineKeyboardMarkup(keyboard))
+        return
+
+    # если ни один из обработчиков не сработал — ничего не делаем
+    return
+
 
     # супер-игра — выбор клетки
     if data.startswith("super_pick:"):
@@ -826,7 +958,51 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
     text = update.message.text.strip()
 
-    # NICK flow (высший приоритет)
+    # 1) WINTER NICK flow (высший приоритет для ввода ника в зимнем режиме)
+    if context.user_data.get("awaiting_winter_nick"):
+        new_nick = text.strip()
+        context.user_data["awaiting_winter_nick"] = False
+        prompt_mid = context.user_data.get("winter_nick_prompt_mid")
+        # ❗ Ник не должен содержать @
+        if "@" in new_nick:
+            await update.message.reply_text("🚫 Ник не должен содержать символ '@'. Введи другой ник.")
+            context.user_data["awaiting_winter_nick"] = True
+            return
+
+        # Обновляем таблицу winter2026
+        try:
+            s_w = winter.sheet_winter_users()
+            row, record = winter.find_winter_user_row(s_w, user_id)
+            if record is None:
+                winter.create_new_winter_user(s_w, user_id)
+                row, record = winter.find_winter_user_row(s_w, user_id)
+            col = winter.column_letter_by_name(s_w, "NICK")
+            s_w.update([[new_nick]], f"{col}{row}", value_input_option="USER_ENTERED")
+            _, new_record = winter.find_winter_user_row(s_w, user_id)
+        except Exception as e:
+            logger.exception("Не удалось записать зимний ник: %s", e)
+            await update.message.reply_text("⚠️ Не удалось установить ник в зимнем режиме. Попробуй позже.")
+            context.user_data["winter_nick_prompt_mid"] = None
+            return
+
+        # Редактируем исходное сообщение (prompt) в меню зимнего режима обратно в меню
+        try:
+            if prompt_mid:
+                await context.bot.edit_message_text(chat_id=chat_id, message_id=prompt_mid,
+                                                    text=winter.get_winter_menu_text(new_record),
+                                                    reply_markup=winter.get_winter_menu_markup())
+            else:
+                await context.bot.send_message(chat_id=chat_id, text=winter.get_winter_menu_text(new_record),
+                                               reply_markup=winter.get_winter_menu_markup())
+        except Exception:
+            # fallback: отправить новое сообщение
+            await context.bot.send_message(chat_id=chat_id, text=winter.get_winter_menu_text(new_record),
+                                           reply_markup=winter.get_winter_menu_markup())
+
+        context.user_data["winter_nick_prompt_mid"] = None
+        return
+
+    # 2) NICK flow (высший приоритет для основного режима)
     if context.user_data.get("awaiting_nick"):
         new_nick = text.strip()
         context.user_data["awaiting_nick"] = False
@@ -872,15 +1048,15 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _, new_record = find_user_row_fast(s_users, user_id)
         if prompt_mid:
             try:
-                await context.bot.edit_message_text(chat_id=chat_id, message_id=prompt_mid, text=get_main_menu_text(new_record), reply_markup=get_main_menu_markup())
+                await context.bot.edit_message_text(chat_id=chat_id, message_id=prompt_mid, text=get_main_menu_text(new_record), reply_markup=get_main_menu_markup(is_admin=(user_id==winter.ADMIN_ID)))
             except Exception:
-                await context.bot.send_message(chat_id=chat_id, text=get_main_menu_text(new_record), reply_markup=get_main_menu_markup())
+                await context.bot.send_message(chat_id=chat_id, text=get_main_menu_text(new_record), reply_markup=get_main_menu_markup(is_admin=(user_id==winter.ADMIN_ID)))
         else:
-            await context.bot.send_message(chat_id=chat_id, text=get_main_menu_text(new_record), reply_markup=get_main_menu_markup())
+            await context.bot.send_message(chat_id=chat_id, text=get_main_menu_text(new_record), reply_markup=get_main_menu_markup(is_admin=(user_id==winter.ADMIN_ID)))
         context.user_data["nick_prompt_mid"] = None
         return
 
-    # PROMO flow
+    # 3) PROMO flow
     if context.user_data.get("awaiting_promo"):
         promo = text.strip().upper()
         context.user_data["awaiting_promo"] = False
@@ -918,14 +1094,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     chat_id=chat_id,
                     message_id=prompt_mid,
                     text=get_main_menu_text(new_record) + "\n\n" + result_text,
-                    reply_markup=get_main_menu_markup(),
+                    reply_markup=get_main_menu_markup(is_admin=(user_id==winter.ADMIN_ID)),
                 )
             except Exception:
-                await context.bot.send_message(chat_id=chat_id, text=get_main_menu_text(new_record), reply_markup=get_main_menu_markup())
+                await context.bot.send_message(chat_id=chat_id, text=get_main_menu_text(new_record), reply_markup=get_main_menu_markup(is_admin=(user_id==winter.ADMIN_ID)))
                 await context.bot.send_message(chat_id=chat_id, text=result_text)
         else:
             _, new_record = find_user_row_fast(s_users, user_id)
-            await context.bot.send_message(chat_id=chat_id, text=get_main_menu_text(new_record), reply_markup=get_main_menu_markup())
+            await context.bot.send_message(chat_id=chat_id, text=get_main_menu_text(new_record), reply_markup=get_main_menu_markup(is_admin=(user_id==winter.ADMIN_ID)))
             await context.bot.send_message(chat_id=chat_id, text=result_text)
 
         context.user_data["promo_prompt_mid"] = None
@@ -933,6 +1109,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # если не промо/ник — игнорируем текст
     return
+
 
 def build_super_markup(hidden=True, grid=None, chosen_idx=None):
     """
@@ -1066,6 +1243,11 @@ def main():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("reload_lb", reload_leaderboard_command))
+
+    # подключаем winter-пакет (обработчики для всех callback_data, начинающихся с "winter_")
+    winter.register_winter_handlers(app)
+    winter_frame.register_frame_handlers(app)
+
     app.add_handler(CallbackQueryHandler(button_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
