@@ -1056,11 +1056,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["nick_prompt_mid"] = None
         return
 
-    # 3) PROMO flow
+    # 3) PROMO flow (robust)
     if context.user_data.get("awaiting_promo"):
         promo = text.strip().upper()
         context.user_data["awaiting_promo"] = False
         prompt_mid = context.user_data.get("promo_prompt_mid")
+
         promo_data = load_promo_codes()
         s_users = sheet_users()
         row, record = find_user_row_fast(s_users, user_id)
@@ -1071,17 +1072,42 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if promo in promo_data:
             meta = promo_data[promo]
-            col_letter = meta["column"].strip().upper()
-            col_header = get_header_name_by_letter(s_users, col_letter)
+            col_spec = str(meta.get("column") or "").strip()
+            # Определяем: если col_spec — буквы A..Z (например "G" или "AA") — считаем это буквой столбца.
+            # Иначе — считаем это имя заголовка (например "PROMO_WM") и найдём букву через column_letter_by_name.
+            import re as _re
+            if _re.fullmatch(r"[A-Z]+", col_spec.upper() or ""):
+                col_letter = col_spec.upper()
+                col_header = get_header_name_by_letter(s_users, col_letter)
+                # если заголовка на этой позиции нет — попробуем использовать сам col_spec как заголовок
+                if not col_header:
+                    col_header = col_spec
+            else:
+                # col_spec — имя заголовка
+                col_header = col_spec
+                col_letter = column_letter_by_name(s_users, col_header)
+
             used = str(record.get(col_header) or "").strip()
             if used == "1":
                 result_text = "🚫 Ты уже использовал этот промокод."
             else:
-                spins = int(record.get("SPINS") or 0)
-                new_spins = min(spins + meta["bonus"], MAX_SPINS)
-                s_users.update([[new_spins]], f"D{row}")
-                s_users.update([["1"]], f"{col_letter}{row}")
-                result_text = f"{meta['desc']}\n🎉 +{meta['bonus']} спина! Теперь у тебя {new_spins}."
+                try:
+                    spins = int(record.get("SPINS") or 0)
+                except Exception:
+                    spins = 0
+                bonus = int(meta.get("bonus") or 0)
+                new_spins = min(spins + bonus, MAX_SPINS)
+
+                # используем надёжный способ получить букву колонки SPINS
+                spin_col = column_letter_by_name(s_users, "SPINS")
+                try:
+                    s_users.update([[new_spins]], f"{spin_col}{row}", value_input_option="USER_ENTERED")
+                    # пометим промо как использованное
+                    s_users.update([["1"]], f"{col_letter}{row}", value_input_option="USER_ENTERED")
+                    result_text = f"{meta.get('desc','')}\n🎉 +{bonus} спина! Теперь у тебя {new_spins}."
+                except Exception as e:
+                    logger.exception("Ошибка при применении промокода: %s", e)
+                    result_text = "⚠️ Не удалось применить промокод из-за ошибки записи. Попробуй позже."
         else:
             result_text = "❌ Неверный промокод."
 
@@ -1106,9 +1132,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         context.user_data["promo_prompt_mid"] = None
         return
-
-    # если не промо/ник — игнорируем текст
-    return
 
 
 def build_super_markup(hidden=True, grid=None, chosen_idx=None):
@@ -1244,12 +1267,19 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("reload_lb", reload_leaderboard_command))
 
-    # подключаем winter-пакет (обработчики для всех callback_data, начинающихся с "winter_")
+
+    # подключаем winter-пакет (специфичные callback'ы и frame-хендлеры)
     winter.register_winter_handlers(app)
     winter_frame.register_frame_handlers(app)
+    winter.load_winter_cats_once()
 
-    app.add_handler(CallbackQueryHandler(button_callback))
+    # основной TEXT handler — должен быть до универсального frame/text перехватчика
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+
+    # универсальный callback handler — должен быть ПОСЛЕ всех специфичных CallbackQueryHandlers,
+    # чтобы не перехватывать кнопки вроде "winter_*" или "frame_*".
+    app.add_handler(CallbackQueryHandler(button_callback))
+
 
     print("Бот запущен")
     app.run_polling()

@@ -21,6 +21,7 @@ import logging
 from datetime import datetime, timedelta, date
 import aiohttp
 from io import BytesIO
+import asyncio
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes, CallbackQueryHandler
@@ -49,6 +50,15 @@ WINTER_ADVENT_SHEET = "winter_advent"
 _WINTER_CATS_CACHE = {"ts": 0, "data": None}
 CATS_TTL = 300
 
+# leader cache
+_WINTER_LEADER_CACHE = {"ts": 0, "data": None}
+_WINTER_LEADER_TTL = 60  # 1 минута
+_winter_leader_lock = asyncio.Lock()
+
+# shop cache
+_WINTER_SHOP_CACHE = {"ts": 0, "data": None}
+_WINTER_SHOP_TTL = 300  # 5 минут
+
 # лимит спинов
 MAX_WINTER_SPINS = 999
 CASHBACK_PER_SPIN = 10
@@ -76,7 +86,7 @@ MAX_LUCK = 100
 LUCK_PER_COMMON = 2
 LUCK_DECREASE_ON_RARE = 10
 LUCK_WEIGHT_SCALE = 4
-GUARANTEED_EPIC_LUCK = 60
+GUARANTEED_EPIC_LUCK = 70
 
 FRAME_DEFAULT = 10
 FRAME_MAX = 12
@@ -171,7 +181,7 @@ def find_winter_user_row(sheet, user_id):
         return None, None
 
 def create_new_winter_user(sheet, user_id):
-    row_values = [user_id, "", "", 3, 0, 0, "", 0, "", "", "", " ", 10]
+    row_values = [user_id, "", "", 3, 0, 0, "", 0, "", "", "", "", 10]
     sheet.append_row(row_values, value_input_option="USER_ENTERED")
     return 3
 
@@ -187,20 +197,130 @@ def clean_cat_records(records):
         cleaned.append({"id": cid, "url": url, "desc": desc, "rarity": rarity})
     return cleaned
 
-def get_winter_cats_cached():
-    now = time.time()
-    if _WINTER_CATS_CACHE["data"] is not None and (now - _WINTER_CATS_CACHE["ts"]) < CATS_TTL:
+def load_winter_cats_once():
+    """
+    Загрузить таблицу winter_cats *один раз* и пометить как static.
+    Вызвать при старте бота (main) — тогда get_winter_cats_cached будет возвращать кэш всегда.
+    """
+    global _WINTER_CATS_CACHE
+    # если уже загружено — вернуть
+    if _WINTER_CATS_CACHE["data"] is not None:
+        _WINTER_CATS_CACHE["static"] = True
         return _WINTER_CATS_CACHE["data"]
-    s = sheet_winter_cats()
+
     try:
+        s = sheet_winter_cats()
         records = s.get_all_records()
         cats = clean_cat_records(records)
     except Exception as e:
-        logger.exception("Ошибка чтения winter_cats: %s", e)
+        logger.exception("preload load_winter_cats_once failed: %s", e)
         cats = []
+
+    _WINTER_CATS_CACHE["data"] = cats
+    _WINTER_CATS_CACHE["ts"] = time.time()
+    _WINTER_CATS_CACHE["static"] = True
+    logger.info("winter_cats preloaded: %d items", len(cats))
+    return cats
+
+def get_winter_cats_cached():
+    """
+    Возвращает kэш каталога котов.
+    - Если load_winter_cats_once() был вызван (static=True), возвращаем всегда один и тот же кэш.
+    - Иначе — обычный TTL-based кэш (CATS_TTL).
+    (Функция совместима с существующим кодом.)
+    """
+    now = time.time()
+    if _WINTER_CATS_CACHE["data"] is not None:
+        # если поставлен static — сразу вернуть (не дергаем sheets)
+        if _WINTER_CATS_CACHE.get("static"):
+            return _WINTER_CATS_CACHE["data"]
+        # иначе — проверяем TTL
+        if (now - _WINTER_CATS_CACHE["ts"]) < CATS_TTL:
+            return _WINTER_CATS_CACHE["data"]
+
+    # загрузим свежие записи
+    try:
+        s = sheet_winter_cats()
+        records = s.get_all_records()
+        cats = clean_cat_records(records)
+    except Exception as e:
+        logger.exception("Ошибка чтения winter_cats (get_winter_cats_cached): %s", e)
+        # если кэш уже есть — вернём его, иначе пустой список
+        return _WINTER_CATS_CACHE["data"] or []
+
     _WINTER_CATS_CACHE["data"] = cats
     _WINTER_CATS_CACHE["ts"] = now
     return cats
+
+# --- Leaderboard (async) cache ---
+async def get_winter_leader_cached():
+    """
+    Возвращает список записей winter_top c кешем 60s.
+    """
+    now = time.time()
+    if _WINTER_LEADER_CACHE["data"] is not None and (now - _WINTER_LEADER_CACHE["ts"]) < _WINTER_LEADER_TTL:
+        return _WINTER_LEADER_CACHE["data"]
+
+    async with _winter_leader_lock:
+        now = time.time()
+        if _WINTER_LEADER_CACHE["data"] is not None and (now - _WINTER_LEADER_CACHE["ts"]) < _WINTER_LEADER_TTL:
+            return _WINTER_LEADER_CACHE["data"]
+        try:
+            s_top = sheet_winter_leader()
+            records = s_top.get_all_records() if s_top else []
+        except Exception as e:
+            logger.warning("Ошибка при чтении winter_top: %s", e)
+            records = []
+        _WINTER_LEADER_CACHE["data"] = records
+        _WINTER_LEADER_CACHE["ts"] = time.time()
+        return records
+
+# --- Shop cache (sync) ---
+def load_shop_items():
+    """
+    Кеширующая оболочка вокруг чтения winter_shop.
+    TTL = _WINTER_SHOP_TTL (5 минут).
+    (Совместима с существующими вызовами load_shop_items() в коде.)
+    """
+    now = time.time()
+    if _WINTER_SHOP_CACHE["data"] is not None and (now - _WINTER_SHOP_CACHE["ts"]) < _WINTER_SHOP_TTL:
+        return _WINTER_SHOP_CACHE["data"]
+
+    # старый код чтения таблицы (минорные правки: конвертации как в оригинале)
+    try:
+        s = sheet_winter_shop()
+        rows = s.get_all_records()
+        items = []
+        for r in rows:
+            item = {k: (r.get(k) if r.get(k) is not None else "") for k in r.keys()}
+            try:
+                item["PRICE"] = int(r.get("PRICE") or 0)
+            except Exception:
+                item["PRICE"] = 0
+            try:
+                item["SPINS"] = int(r.get("SPINS") or 0)
+            except Exception:
+                item["SPINS"] = 0
+            try:
+                item["LUCK"] = int(r.get("LUCK") or 0)
+            except Exception:
+                item["LUCK"] = 0
+            q = r.get("QUANTITY")
+            if q is None or str(q).strip() == "":
+                item["QUANTITY"] = None
+            else:
+                try:
+                    item["QUANTITY"] = int(q)
+                except Exception:
+                    item["QUANTITY"] = None
+            items.append(item)
+    except Exception as e:
+        logger.exception("Ошибка чтения winter_shop: %s", e)
+        items = []
+
+    _WINTER_SHOP_CACHE["data"] = items
+    _WINTER_SHOP_CACHE["ts"] = now
+    return items
 
 # -------------------------- Advent calendar helpers --------------------------
 
@@ -428,8 +548,6 @@ def adjust_luck_after_spin(s_users, row, gained_rarity):
         cur = 0
     if gained_rarity in ('COM', 'UCOM'):
         cur = min(MAX_LUCK, cur + LUCK_PER_COMMON)
-    elif gained_rarity in ('RARE'):
-        cur = cur
     else:
         cur = max(0, cur - LUCK_DECREASE_ON_RARE)
     try:

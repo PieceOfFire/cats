@@ -614,6 +614,11 @@ async def cmd_frame(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def frame_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+
+    # Защита: гарантируем, что context.user_data — словарь
+    if context.user_data is None:
+        context.user_data = {}
+
     data = query.data or ""
     user_id = query.from_user.id
     chat_id = query.message.chat_id
@@ -931,6 +936,10 @@ async def frame_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
     await query.answer()
 
 async def text_message_handler_for_frame(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Защита: гарантируем, что context.user_data — словарь, а не None
+    if context.user_data is None:
+        context.user_data = {}
+
     if not context.user_data.get("awaiting_frame_id"):
         return
 
@@ -999,4 +1008,7 @@ async def text_message_handler_for_frame(update: Update, context: ContextTypes.D
 def register_frame_handlers(application):
     application.add_handler(CommandHandler("frame", cmd_frame))
     application.add_handler(CallbackQueryHandler(frame_callback_handler, pattern=r"^frame_"))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_message_handler_for_frame))
+    application.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, text_message_handler_for_frame),
+        group=10
+    )
