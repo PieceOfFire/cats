@@ -646,7 +646,7 @@ async def frame_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
         if record:
             owned_raw = record.get("W_CATS_ID") or record.get("W_CATS") or record.get("W_CATS_ID".upper()) or ""
         owned_tokens = [t.strip() for t in __import__("re").split(r"[|,;\\s]+", str(owned_raw)) if t.strip()]
-        owned_preview = ", ".join(owned_tokens[:12]) if owned_tokens else "(у тебя нет зимних карточек)"
+        owned_preview = ", ".join(owned_tokens[:]) if owned_tokens else "(у тебя нет зимних карточек)"
         txt = (
             f"Выбраан слот #{pos}. Введи ID карточки (числом) из твоих карточек.\n\n"
             f"Твои карточки (превью): {owned_preview}\n\n"
@@ -1012,3 +1012,4 @@ def register_frame_handlers(application):
         MessageHandler(filters.TEXT & ~filters.COMMAND, text_message_handler_for_frame),
         group=10
     )
+
