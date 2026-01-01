@@ -21,7 +21,6 @@ import logging
 from datetime import datetime, timedelta, date
 import aiohttp
 from io import BytesIO
-import asyncio
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes, CallbackQueryHandler
@@ -50,15 +49,6 @@ WINTER_ADVENT_SHEET = "winter_advent"
 _WINTER_CATS_CACHE = {"ts": 0, "data": None}
 CATS_TTL = 300
 
-# leader cache
-_WINTER_LEADER_CACHE = {"ts": 0, "data": None}
-_WINTER_LEADER_TTL = 60  # 1 минута
-_winter_leader_lock = asyncio.Lock()
-
-# shop cache
-_WINTER_SHOP_CACHE = {"ts": 0, "data": None}
-_WINTER_SHOP_TTL = 300  # 5 минут
-
 # лимит спинов
 MAX_WINTER_SPINS = 999
 CASHBACK_PER_SPIN = 10
@@ -86,7 +76,7 @@ MAX_LUCK = 100
 LUCK_PER_COMMON = 2
 LUCK_DECREASE_ON_RARE = 10
 LUCK_WEIGHT_SCALE = 4
-GUARANTEED_EPIC_LUCK = 70
+GUARANTEED_EPIC_LUCK = 60
 
 FRAME_DEFAULT = 10
 FRAME_MAX = 12
@@ -181,7 +171,7 @@ def find_winter_user_row(sheet, user_id):
         return None, None
 
 def create_new_winter_user(sheet, user_id):
-    row_values = [user_id, "", "", 3, 0, 0, "", 0, "", "", "", "", 10]
+    row_values = [user_id, "", "", 3, 0, 0, "", 0, "", "", "", " ", 10]
     sheet.append_row(row_values, value_input_option="USER_ENTERED")
     return 3
 
@@ -197,130 +187,20 @@ def clean_cat_records(records):
         cleaned.append({"id": cid, "url": url, "desc": desc, "rarity": rarity})
     return cleaned
 
-def load_winter_cats_once():
-    """
-    Загрузить таблицу winter_cats *один раз* и пометить как static.
-    Вызвать при старте бота (main) — тогда get_winter_cats_cached будет возвращать кэш всегда.
-    """
-    global _WINTER_CATS_CACHE
-    # если уже загружено — вернуть
-    if _WINTER_CATS_CACHE["data"] is not None:
-        _WINTER_CATS_CACHE["static"] = True
-        return _WINTER_CATS_CACHE["data"]
-
-    try:
-        s = sheet_winter_cats()
-        records = s.get_all_records()
-        cats = clean_cat_records(records)
-    except Exception as e:
-        logger.exception("preload load_winter_cats_once failed: %s", e)
-        cats = []
-
-    _WINTER_CATS_CACHE["data"] = cats
-    _WINTER_CATS_CACHE["ts"] = time.time()
-    _WINTER_CATS_CACHE["static"] = True
-    logger.info("winter_cats preloaded: %d items", len(cats))
-    return cats
-
 def get_winter_cats_cached():
-    """
-    Возвращает kэш каталога котов.
-    - Если load_winter_cats_once() был вызван (static=True), возвращаем всегда один и тот же кэш.
-    - Иначе — обычный TTL-based кэш (CATS_TTL).
-    (Функция совместима с существующим кодом.)
-    """
     now = time.time()
-    if _WINTER_CATS_CACHE["data"] is not None:
-        # если поставлен static — сразу вернуть (не дергаем sheets)
-        if _WINTER_CATS_CACHE.get("static"):
-            return _WINTER_CATS_CACHE["data"]
-        # иначе — проверяем TTL
-        if (now - _WINTER_CATS_CACHE["ts"]) < CATS_TTL:
-            return _WINTER_CATS_CACHE["data"]
-
-    # загрузим свежие записи
+    if _WINTER_CATS_CACHE["data"] is not None and (now - _WINTER_CATS_CACHE["ts"]) < CATS_TTL:
+        return _WINTER_CATS_CACHE["data"]
+    s = sheet_winter_cats()
     try:
-        s = sheet_winter_cats()
         records = s.get_all_records()
         cats = clean_cat_records(records)
     except Exception as e:
-        logger.exception("Ошибка чтения winter_cats (get_winter_cats_cached): %s", e)
-        # если кэш уже есть — вернём его, иначе пустой список
-        return _WINTER_CATS_CACHE["data"] or []
-
+        logger.exception("Ошибка чтения winter_cats: %s", e)
+        cats = []
     _WINTER_CATS_CACHE["data"] = cats
     _WINTER_CATS_CACHE["ts"] = now
     return cats
-
-# --- Leaderboard (async) cache ---
-async def get_winter_leader_cached():
-    """
-    Возвращает список записей winter_top c кешем 60s.
-    """
-    now = time.time()
-    if _WINTER_LEADER_CACHE["data"] is not None and (now - _WINTER_LEADER_CACHE["ts"]) < _WINTER_LEADER_TTL:
-        return _WINTER_LEADER_CACHE["data"]
-
-    async with _winter_leader_lock:
-        now = time.time()
-        if _WINTER_LEADER_CACHE["data"] is not None and (now - _WINTER_LEADER_CACHE["ts"]) < _WINTER_LEADER_TTL:
-            return _WINTER_LEADER_CACHE["data"]
-        try:
-            s_top = sheet_winter_leader()
-            records = s_top.get_all_records() if s_top else []
-        except Exception as e:
-            logger.warning("Ошибка при чтении winter_top: %s", e)
-            records = []
-        _WINTER_LEADER_CACHE["data"] = records
-        _WINTER_LEADER_CACHE["ts"] = time.time()
-        return records
-
-# --- Shop cache (sync) ---
-def load_shop_items():
-    """
-    Кеширующая оболочка вокруг чтения winter_shop.
-    TTL = _WINTER_SHOP_TTL (5 минут).
-    (Совместима с существующими вызовами load_shop_items() в коде.)
-    """
-    now = time.time()
-    if _WINTER_SHOP_CACHE["data"] is not None and (now - _WINTER_SHOP_CACHE["ts"]) < _WINTER_SHOP_TTL:
-        return _WINTER_SHOP_CACHE["data"]
-
-    # старый код чтения таблицы (минорные правки: конвертации как в оригинале)
-    try:
-        s = sheet_winter_shop()
-        rows = s.get_all_records()
-        items = []
-        for r in rows:
-            item = {k: (r.get(k) if r.get(k) is not None else "") for k in r.keys()}
-            try:
-                item["PRICE"] = int(r.get("PRICE") or 0)
-            except Exception:
-                item["PRICE"] = 0
-            try:
-                item["SPINS"] = int(r.get("SPINS") or 0)
-            except Exception:
-                item["SPINS"] = 0
-            try:
-                item["LUCK"] = int(r.get("LUCK") or 0)
-            except Exception:
-                item["LUCK"] = 0
-            q = r.get("QUANTITY")
-            if q is None or str(q).strip() == "":
-                item["QUANTITY"] = None
-            else:
-                try:
-                    item["QUANTITY"] = int(q)
-                except Exception:
-                    item["QUANTITY"] = None
-            items.append(item)
-    except Exception as e:
-        logger.exception("Ошибка чтения winter_shop: %s", e)
-        items = []
-
-    _WINTER_SHOP_CACHE["data"] = items
-    _WINTER_SHOP_CACHE["ts"] = now
-    return items
 
 # -------------------------- Advent calendar helpers --------------------------
 
@@ -346,27 +226,60 @@ def get_advent_reward_for_day(day_index):
     return 0, 0, 0
 
 def _default_advent_start_end():
+    """
+    Возвращает (start_date, end_date) для адвента.
+    Ожидаемый стандарт: старт 22 декабря, конец 10 января (пересекает год).
+    Логика:
+      - Если заданы WINTER_EVENT_START / WINTER_EVENT_END в env — парсим их.
+      - Иначе:
+          * если сейчас декабрь  -> берем этот декабрь как старт и январь следующего года как конец
+          * если сейчас январь   -> берем декабрь предыдущего года как старт и этот январь как конец
+          * иначе                -> берем ближайший декабрь этого года как старт и январь следующего года как конец
+    Это корректно обрабатывает переход через новый год.
+    """
     start_str = os.environ.get("WINTER_EVENT_START")
     end_str = os.environ.get("WINTER_EVENT_END")
     try:
         if start_str:
             start_date = datetime.fromisoformat(start_str).date()
         else:
-            now = datetime.utcnow()
-            start_date = date(now.year, ADVENT_DEFAULT_START_MONTH, ADVENT_DEFAULT_START_DAY)
+            now = datetime.utcnow().date()
+            if now.month == 12:
+                start_date = date(now.year, ADVENT_DEFAULT_START_MONTH, ADVENT_DEFAULT_START_DAY)
+            elif now.month == 1:
+                # если январь — старт был в декабре предыдущего года
+                start_date = date(now.year - 1, ADVENT_DEFAULT_START_MONTH, ADVENT_DEFAULT_START_DAY)
+            else:
+                # для остальных месяцев считаем, что ближайший адвент начнётся в декабре этого года
+                start_date = date(now.year, ADVENT_DEFAULT_START_MONTH, ADVENT_DEFAULT_START_DAY)
+
         if end_str:
             end_date = datetime.fromisoformat(end_str).date()
         else:
-            if start_date.month == 12:
+            # если старт в декабре — конец в январе следующего года
+            if start_date.month == 12 and ADVENT_DEFAULT_END_MONTH == 1:
                 end_date = date(start_date.year + 1, ADVENT_DEFAULT_END_MONTH, ADVENT_DEFAULT_END_DAY)
             else:
                 end_date = date(start_date.year, ADVENT_DEFAULT_END_MONTH, ADVENT_DEFAULT_END_DAY)
+
+        # debug/log — полезно для отладки после деплоя
+        try:
+            logger.debug("Advent window resolved: %s -> %s", start_date, end_date)
+        except Exception:
+            pass
+
         return start_date, end_date
     except Exception:
-        now = datetime.utcnow()
-        start_date = date(now.year, ADVENT_DEFAULT_START_MONTH, ADVENT_DEFAULT_START_DAY)
-        end_date = date(start_date.year + 1, ADVENT_DEFAULT_END_MONTH, ADVENT_DEFAULT_END_DAY)
-        return start_date, end_date
+        # безопасный fallback: если что-то пошло не так — строим логически ожидаемое окно
+        now = datetime.utcnow().date()
+        if now.month == 1:
+            return date(now.year - 1, ADVENT_DEFAULT_START_MONTH, ADVENT_DEFAULT_START_DAY), date(now.year, ADVENT_DEFAULT_END_MONTH, ADVENT_DEFAULT_END_DAY)
+        else:
+            s = date(now.year, ADVENT_DEFAULT_START_MONTH, ADVENT_DEFAULT_START_DAY)
+            if s.month == 12 and ADVENT_DEFAULT_END_MONTH == 1:
+                return s, date(s.year + 1, ADVENT_DEFAULT_END_MONTH, ADVENT_DEFAULT_END_DAY)
+            return s, date(s.year, ADVENT_DEFAULT_END_MONTH, ADVENT_DEFAULT_END_DAY)
+
 
 def read_user_advent_state(s_users, row, days_count):
     headers = s_users.row_values(1)
@@ -548,6 +461,8 @@ def adjust_luck_after_spin(s_users, row, gained_rarity):
         cur = 0
     if gained_rarity in ('COM', 'UCOM'):
         cur = min(MAX_LUCK, cur + LUCK_PER_COMMON)
+    elif gained_rarity in ('RARE'):
+        cur = cur
     else:
         cur = max(0, cur - LUCK_DECREASE_ON_RARE)
     try:
